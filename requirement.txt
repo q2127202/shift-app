@@ -1,5 +1,7 @@
-Faker==25.2.0
-holidays==0.46
-numpy==1.26.4
-pandas==2.2.2
-streamlit==1.35.0
+streamlit>=1.25
+pandas>=1.5
+numpy>=1.22
+holidays>=0.24
+faker>=15.3
+plotly>=5.15
+Pillow>=9.4
