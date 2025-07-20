@@ -5,3 +5,4 @@ holidays>=0.24
 faker>=15.3
 plotly>=5.15
 Pillow>=9.4
+openpyxl>=3.0.10
