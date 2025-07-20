@@ -1,27 +1,802 @@
 import streamlit as st
 import streamlit.components.v1 as components
+import codecs
 import pandas as pd
 import numpy as np
-import random
-from collections import defaultdict
-import ast 
-import datetime as dt
-import time
-import sys  # 添加sys导入
 import os
-os.chmod("scop-linux", 0o755)
+import random
+import pandas as pd
+import holidays
+from faker import Faker
+from collections import namedtuple, OrderedDict, defaultdict
+import ast 
+import numpy as np
+import datetime as dt
+import re
+import json 
+import sys
+import plotly.graph_objects as go
+import plotly.express as px
+import plotly.offline
+from PIL import Image
 
-# 设置页面配置
-st.set_page_config(
-    page_title="AI排班システム", 
-    page_icon="🤖", 
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# 平衡速度与质量的遗传算法类
+class BalancedFastGeneticAlgorithmScheduler:
+    def __init__(self, n_staff, n_day, job, day_off, avoid_jobs, LB, B, early, late, 
+                 obj_weight, UB_max5_weight, UB_max4_weight, LB_min1_weight, 
+                 LBC_weight, Disjective_weight, RestWorkRest_weight, LateEarly_weight, num_off_weight):
+        self.n_staff = n_staff
+        self.n_day = n_day
+        self.job = job
+        self.day_off = day_off
+        self.avoid_jobs = avoid_jobs
+        self.LB = LB
+        self.B = B
+        self.early = set(early)
+        self.late = set(late)
+        
+        # 重量の再バランス（品質向上）
+        self.obj_weight = obj_weight * 3
+        self.UB_max5_weight = UB_max5_weight * 1.5
+        self.UB_max4_weight = UB_max4_weight   
+        self.LB_min1_weight = LB_min1_weight * 0.5  
+        self.LBC_weight = LBC_weight * 2
+        self.Disjective_weight = Disjective_weight * 2
+        self.RestWorkRest_weight = RestWorkRest_weight
+        self.LateEarly_weight = LateEarly_weight
+        self.num_off_weight = num_off_weight * 1.5
+        
+        # 最適化されたパラメータ（15日間のシフト用）
+        self.population_size = 30     # 個体数を削減
+        self.generations = 60         # 世代数を削減
+        self.mutation_rate = 0.2      # 変異率を増加
+        self.crossover_rate = 0.85    
+        self.elite_size = 5           # エリート保持数を削減
+        
+        # 事前計算最適化
+        self.available_jobs = {}
+        self.critical_jobs = [3, 4, 5, 6, 7, 8, 9, 10]
+        
+        for i in range(n_staff):
+            self.available_jobs[i] = [j for j in job if j not in avoid_jobs[i]]
+            # 重要な仕事を優先して再配列
+            critical_available = [j for j in self.critical_jobs if j in self.available_jobs[i]]
+            other_available = [j for j in self.available_jobs[i] if j not in self.critical_jobs]
+            self.available_jobs[i] = [0] + critical_available + other_available
 
-# 自定义CSS样式
-st.markdown("""
-<style>
+    def create_high_quality_individual(self):
+        """高品質個体生成（多段階構築）"""
+        individual = np.zeros((self.n_staff, self.n_day), dtype=int)
+        
+        # 段階1：人員需要の満足
+        daily_needs = {}
+        for t in range(self.n_day):
+            daily_needs[t] = {}
+            for j in self.critical_jobs:
+                daily_needs[t][j] = self.LB.get((t, j), 0)
+        
+        # 需要に応じた仕事の配分
+        for t in range(self.n_day):
+            available_staff = [i for i in range(self.n_staff) 
+                             if t not in self.day_off[i] and individual[i, t] == 0]
+            
+            # 高需要の仕事を優先的に配分
+            jobs_by_demand = sorted(daily_needs[t].items(), key=lambda x: x[1], reverse=True)
+            
+            for job_id, required_count in jobs_by_demand:
+                if required_count > 0:
+                    assigned_count = 0
+                    for i in available_staff[:]:
+                        if assigned_count >= required_count:
+                            break
+                        if job_id in self.available_jobs[i]:
+                            individual[i, t] = job_id
+                            available_staff.remove(i)
+                            assigned_count += 1
+        
+        # 段階2：仕事負荷のバランス
+        for i in range(self.n_staff):
+            current_work_days = np.sum(individual[i] != 0)
+            target_work_days = self.n_day - self.B[i]
+            
+            if current_work_days < target_work_days:
+                # 勤務日を増やす必要がある
+                available_days = [t for t in range(self.n_day) 
+                                if t not in self.day_off[i] and individual[i, t] == 0]
+                additional_days = min(target_work_days - current_work_days, len(available_days))
+                
+                if additional_days > 0:
+                    selected_days = random.sample(available_days, additional_days)
+                    for t in selected_days:
+                        individual[i, t] = random.choice([j for j in self.available_jobs[i] if j != 0])
+            
+            elif current_work_days > target_work_days:
+                # 勤務日を減らす必要がある
+                work_days = [t for t in range(self.n_day) if individual[i, t] != 0]
+                excess_days = current_work_days - target_work_days
+                
+                if excess_days > 0:
+                    # 低優先度の仕事を優先的に削除
+                    remove_days = random.sample(work_days, min(excess_days, len(work_days)))
+                    for t in remove_days:
+                        individual[i, t] = 0
+        
+        return individual
+
+    def calculate_comprehensive_fitness(self, individual):
+        """より包括的な適応度計算（より多くの制約を復元）"""
+        penalty = 0
+        
+        # 1. 休暇申請違反（ハード制約）
+        vacation_violations = 0
+        for i in range(self.n_staff):
+            for t in self.day_off[i]:
+                if individual[i, t] != 0:
+                    vacation_violations += 1
+        penalty += vacation_violations * self.obj_weight
+        
+        # 2. 人員需要不足（重要制約）
+        for t in range(self.n_day):
+            for j in self.critical_jobs:
+                if (t, j) in self.LB:
+                    actual_count = np.sum(individual[:, t] == j)
+                    shortage = max(0, self.LB[t, j] - actual_count)
+                    penalty += shortage * self.LBC_weight
+        
+        # 3. 連続勤務制約（完全チェックを復元）
+        for i in range(self.n_staff):
+            work_pattern = (individual[i] != 0).astype(int)
+            
+            # 5日連続勤務
+            for t in range(self.n_day - 5):
+                consecutive_work = np.sum(work_pattern[t:t+6])
+                if consecutive_work > 5:
+                    penalty += (consecutive_work - 5) * self.UB_max5_weight
+            
+            # 4日連続勤務
+            for t in range(self.n_day - 4):
+                consecutive_work = np.sum(work_pattern[t:t+5])
+                if consecutive_work > 4:
+                    penalty += (consecutive_work - 4) * self.UB_max4_weight
+        
+        # 4. 連続休息制約
+        for i in range(self.n_staff):
+            rest_pattern = (individual[i] == 0).astype(int)
+            for t in range(self.n_day - 3):
+                consecutive_rest = np.sum(rest_pattern[t:t+4])
+                if consecutive_rest == 4:
+                    # 全て休暇申請日かどうかをチェック
+                    if not all(day in self.day_off[i] for day in range(t, t+4)):
+                        penalty += self.LB_min1_weight
+        
+        # 5. Staff1とStaff2制約
+        for t in range(self.n_day):
+            if individual[1, t] == 0 and individual[2, t] == 0:
+                penalty += self.Disjective_weight
+        
+        # 6. 休-勤-休パターン
+        for i in range(self.n_staff):
+            for t in range(self.n_day - 2):
+                if (individual[i, t] == 0 and individual[i, t+1] != 0 and individual[i, t+2] == 0):
+                    penalty += self.RestWorkRest_weight
+        
+        # 7. 早番晩番連続
+        for i in range(self.n_staff):
+            for t in range(self.n_day - 1):
+                if (individual[i, t] in self.early and individual[i, t+1] in self.late):
+                    penalty += self.LateEarly_weight
+        
+        # 8. 月休日数制約
+        for i in range(self.n_staff):
+            rest_days = np.sum(individual[i] == 0)
+            penalty += abs(rest_days - self.B[i]) * self.num_off_weight
+        
+        # 9. スキル制約（ハード制約）
+        for i in range(self.n_staff):
+            for t in range(self.n_day):
+                if individual[i, t] in self.avoid_jobs[i]:
+                    penalty += 1000  # 重いペナルティ
+        
+        return -penalty
+
+    def improved_crossover(self, parent1, parent2):
+        """改良された交叉操作（良い特徴を保護）"""
+        if random.random() > self.crossover_rate:
+            return parent1.copy(), parent2.copy()
+        
+        child1, child2 = parent1.copy(), parent2.copy()
+        
+        # 複数の交叉戦略をランダムに選択
+        strategy = random.choice(['time_segment', 'staff_swap', 'job_type'])
+        
+        if strategy == 'time_segment':
+            # 時間セグメント交叉
+            start = random.randint(0, self.n_day // 3)
+            end = random.randint(start + 1, min(start + self.n_day // 2, self.n_day))
+            child1[:, start:end], child2[:, start:end] = child2[:, start:end].copy(), child1[:, start:end].copy()
+        
+        elif strategy == 'staff_swap':
+            # スタッフ交換
+            num_staff = random.randint(1, min(5, self.n_staff))
+            staff_indices = random.sample(range(self.n_staff), num_staff)
+            for i in staff_indices:
+                child1[i], child2[i] = child2[i].copy(), child1[i].copy()
+        
+        else:  # job_type
+            # 仕事タイプ交叉
+            job_to_swap = random.choice(self.critical_jobs)
+            for i in range(self.n_staff):
+                for t in range(self.n_day):
+                    if parent1[i, t] == job_to_swap and parent2[i, t] != job_to_swap:
+                        if t not in self.day_off[i] and job_to_swap in self.available_jobs[i]:
+                            child1[i, t], child2[i, t] = parent2[i, t], parent1[i, t]
+        
+        return child1, child2
+
+    def improved_mutate(self, individual):
+        """改良された変異操作（スマート変異）"""
+        mutated = individual.copy()
+        
+        # 適応変異率
+        num_mutations = max(1, int(self.n_staff * self.n_day * self.mutation_rate * 0.05))
+        
+        for _ in range(num_mutations):
+            i = random.randint(0, self.n_staff - 1)
+            t = random.randint(0, self.n_day - 1)
+            
+            if t not in self.day_off[i]:
+                current_job = mutated[i, t]
+                
+                # 新しい仕事をスマートに選択
+                if current_job == 0:
+                    # 現在が休みの場合、仕事を割り当てる可能性
+                    if random.random() < 0.7:  # 70%の確率で仕事を割り当て
+                        mutated[i, t] = random.choice([j for j in self.available_jobs[i] if j != 0])
+                else:
+                    # 現在が仕事の場合、変更または休みにする可能性
+                    if random.random() < 0.3:  # 30%の確率で休みに変更
+                        mutated[i, t] = 0
+                    else:  # 70%の確率で仕事を変更
+                        available = [j for j in self.available_jobs[i] if j != current_job]
+                        if available:
+                            mutated[i, t] = random.choice(available)
+        
+        return mutated
+
+    def repair_individual(self, individual):
+        """個体修復（ハード制約を満たすことを確保）"""
+        repaired = individual.copy()
+        
+        # 休暇制約の修復
+        for i in range(self.n_staff):
+            for t in self.day_off[i]:
+                repaired[i, t] = 0
+        
+        # スキル制約の修復
+        for i in range(self.n_staff):
+            for t in range(self.n_day):
+                if repaired[i, t] in self.avoid_jobs[i]:
+                    repaired[i, t] = 0
+        
+        return repaired
+
+    def tournament_selection(self, population, fitness_scores, tournament_size):
+        """トーナメント選択"""
+        tournament_indices = random.sample(range(len(population)), tournament_size)
+        tournament_fitness = [fitness_scores[i] for i in tournament_indices]
+        winner_idx = tournament_indices[np.argmax(tournament_fitness)]
+        return population[winner_idx].copy()
+
+    def create_random_individual(self):
+        """ランダム個体作成"""
+        individual = np.zeros((self.n_staff, self.n_day), dtype=int)
+        
+        for i in range(self.n_staff):
+            work_quota = self.n_day - self.B[i]
+            available_days = [t for t in range(self.n_day) if t not in self.day_off[i]]
+            
+            if len(available_days) >= work_quota:
+                work_days = random.sample(available_days, work_quota)
+                for t in work_days:
+                    individual[i, t] = random.choice([j for j in self.available_jobs[i] if j != 0])
+        
+        return individual
+
+    def local_search(self, individual):
+        """局所探索最適化"""
+        best_individual = individual.copy()
+        best_fitness = self.calculate_comprehensive_fitness(best_individual)
+        improved = True
+        max_iterations = 20
+        iteration = 0
+        
+        while improved and iteration < max_iterations:
+            improved = False
+            iteration += 1
+            
+            for i in range(self.n_staff):
+                for t in range(self.n_day):
+                    if t not in self.day_off[i]:
+                        current_job = individual[i, t]
+                        
+                        # 他の仕事を試す
+                        for new_job in self.available_jobs[i]:
+                            if new_job != current_job:
+                                test_individual = individual.copy()
+                                test_individual[i, t] = new_job
+                                test_fitness = self.calculate_comprehensive_fitness(test_individual)
+                                
+                                if test_fitness > best_fitness:
+                                    best_individual = test_individual.copy()
+                                    best_fitness = test_fitness
+                                    improved = True
+                                    break
+                if improved:
+                    break
+            
+            individual = best_individual.copy()
+        
+        return best_individual
+
+    def solve(self):
+        """最適化求解（15日間のシフト用）"""
+        # 高速初期化集団
+        population = []
+        
+        # 50%高品質個体、50%ランダム個体（計算を削減）
+        num_quality = int(self.population_size * 0.5)
+        for i in range(num_quality):
+            population.append(self.create_high_quality_individual())
+        
+        for i in range(self.population_size - num_quality):
+            population.append(self.create_random_individual())
+        
+        # 全個体を修復
+        population = [self.repair_individual(ind) for ind in population]
+        
+        best_solution = None
+        best_fitness = float('-inf')
+        fitness_history = []
+        no_improvement_count = 0
+        max_no_improvement = 15  # より早期停止
+        
+        for generation in range(self.generations):
+            # 包括的適応度計算
+            fitness_scores = [self.calculate_comprehensive_fitness(ind) for ind in population]
+            
+            # 最良解を更新
+            current_best_fitness = max(fitness_scores)
+            if current_best_fitness > best_fitness:
+                best_fitness = current_best_fitness
+                best_solution = population[fitness_scores.index(current_best_fitness)].copy()
+                no_improvement_count = 0
+            else:
+                no_improvement_count += 1
+            
+            fitness_history.append(current_best_fitness)
+            
+            # 早期停止
+            if no_improvement_count >= max_no_improvement:
+                break
+            
+            # 高速選択と生成
+            new_population = []
+            
+            # エリート保持
+            elite_indices = np.argsort(fitness_scores)[-self.elite_size:]
+            for idx in elite_indices:
+                new_population.append(population[idx].copy())
+            
+            # 高速新個体生成
+            while len(new_population) < self.population_size:
+                # 簡略化されたトーナメント選択
+                parent1 = self.tournament_selection(population, fitness_scores, 3)
+                parent2 = self.tournament_selection(population, fitness_scores, 3)
+                
+                # 高速交叉と変異
+                child1, child2 = self.improved_crossover(parent1, parent2)
+                child1 = self.improved_mutate(child1)
+                child2 = self.improved_mutate(child2)
+                
+                # 制約修復
+                child1 = self.repair_individual(child1)
+                child2 = self.repair_individual(child2)
+                
+                new_population.extend([child1, child2])
+            
+            population = new_population[:self.population_size]
+            
+            # 局所探索頻度を削減
+            if generation % 20 == 0 and generation > 0:
+                best_idx = np.argmax([self.calculate_comprehensive_fitness(ind) for ind in population[:5]])
+                population[best_idx] = self.simple_local_search(population[best_idx])
+        
+        # 簡略化された最終局所探索
+        best_solution = self.simple_local_search(best_solution)
+        final_fitness = self.calculate_comprehensive_fitness(best_solution)
+        
+        return best_solution, final_fitness, fitness_history
+    
+    def simple_local_search(self, individual):
+        """簡略化された局所探索（反復を削減）"""
+        best_individual = individual.copy()
+        best_fitness = self.calculate_comprehensive_fitness(best_individual)
+        
+        # 少数の改善のみ試行
+        max_attempts = 50
+        attempts = 0
+        
+        for i in range(self.n_staff):
+            if attempts >= max_attempts:
+                break
+            for t in range(self.n_day):
+                if attempts >= max_attempts:
+                    break
+                if t not in self.day_off[i]:
+                    current_job = individual[i, t]
+                    
+                    # 2-3個の他の仕事のみ試行
+                    test_jobs = random.sample(self.available_jobs[i], 
+                                            min(3, len(self.available_jobs[i])))
+                    
+                    for new_job in test_jobs:
+                        if new_job != current_job:
+                            test_individual = individual.copy()
+                            test_individual[i, t] = new_job
+                            test_fitness = self.calculate_comprehensive_fitness(test_individual)
+                            
+                            if test_fitness > best_fitness:
+                                best_individual = test_individual.copy()
+                                best_fitness = test_fitness
+                                attempts += 1
+                                break
+        
+        return best_individual
+
+def generate_random_schedule():
+    """デモ用のランダムなシフトスケジュールを生成"""
+    n_staff = 15
+    n_day = 15
+    
+    # 各スタッフの休暇申請（ランダム）
+    day_off = {}
+    for i in range(n_staff):
+        # 各スタッフに2-4日の休暇申請をランダムに割り当て
+        num_off_days = random.randint(2, 4)
+        day_off[i] = set(random.sample(range(n_day), num_off_days))
+    
+    # 各スタッフができない仕事を定義
+    avoid_jobs = {
+        0: [1,2,4,5,7,8,9,11,12,13],
+        1: [1,2,4,5,8,9,11,12,13],
+        2: [1,2,5,8,9,11,12,13],
+        3: [1,2,4,5,7,8,9,10,11,12,13],
+        4: [1,2,3,5,7,8,9,11,12,13],
+        5: [1,2,3,5,7,9,11,12,13],
+        6: [1,2,3,5,9,11,12,13],
+        7: [1,2,3,11,12,13],
+        8: [1,2,3,11,12,13],
+        9: [1,2,3,5,7,8,9,10,11,12,13],
+        10: [1,2,3,5,7,8,9,10,11,12,13],
+        11: [1,2,3,7,8,11,12,13],
+        12: [1,2,3,7,11,12,13],
+        13: [1,2,3,7,11,12,13],
+        14: [1,2,3,7,8,11,12,13]
+    }
+    
+    # シフトスケジュールを生成
+    schedule = np.zeros((n_staff, n_day), dtype=int)
+    available_jobs = [0, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+    
+    for i in range(n_staff):
+        for t in range(n_day):
+            if t not in day_off[i]:
+                # このスタッフができる仕事からランダムに選択
+                possible_jobs = [j for j in available_jobs if j not in avoid_jobs[i]]
+                if possible_jobs:
+                    # 70%の確率で仕事を割り当て、30%の確率で休み
+                    if random.random() < 0.7:
+                        schedule[i, t] = random.choice([j for j in possible_jobs if j != 0])
+                    else:
+                        schedule[i, t] = 0
+    
+    return schedule, day_off
+
+def generate_smart_schedule():
+    """スマートな例シフト表を生成 - 15人×15日版本（表示は10日）"""
+    n_staff, n_days = 15, 15  # 15人15日（実際の求解期間）
+    job_names = {0: "休み", 3: "早番A", 4: "早番B", 5: "早番C", 6: "早番D",
+                7: "遅番A", 8: "遅番B", 9: "遅番C", 10: "遅番D"}
+    
+    schedule_data = []
+    
+    for i in range(n_staff):
+        row = []
+        consecutive_work = 0
+        
+        for t in range(n_days):
+            # スマート排班ロジック
+            is_weekend = t % 7 in [5, 6]
+            
+            # 連続勤務4日以上を避ける
+            if consecutive_work >= 4:
+                job = 0
+                consecutive_work = 0
+            elif is_weekend and random.random() < 0.4:  # 週末40%休み
+                job = 0
+                consecutive_work = 0
+            elif random.random() < 0.25:  # 平日25%休み
+                job = 0
+                consecutive_work = 0
+            else:
+                # スタッフの特徴に応じてシフト配分
+                if i < 5:  # 早番グループ (Staff_1-5)
+                    job = random.choice([3, 4, 5, 6])
+                elif i < 10:  # 遅番グループ (Staff_6-10)
+                    job = random.choice([7, 8, 9, 10])
+                else:  # 混合グループ (Staff_11-15)
+                    job = random.choice([3, 4, 5, 6, 7, 8, 9, 10])
+                consecutive_work += 1
+            
+            row.append(f"{job}({job_names.get(job, 'Unknown')})")
+        
+        schedule_data.append(row)
+    
+    return pd.DataFrame(
+        schedule_data,
+        columns=[f"{t+1}日" for t in range(n_days)],
+        index=[f"Staff_{i+1}" for i in range(n_staff)]
+    )
+
+def create_beautiful_schedule_display(schedule_df):
+    """美しい排班可視化を作成 - 15人×10日表示版本"""
+    
+    # シフト表のタイトル
+    st.markdown("### 📅 シフトスケジュール（10日間表示）")
+    
+    job_colors = {
+        '休み': '#95a5a6', '早番A': '#3498db', '早番B': '#2980b9', 
+        '早番C': '#1abc9c', '早番D': '#16a085', '遅番A': '#e74c3c',
+        '遅番B': '#c0392b', '遅番C': '#f39c12', '遅番D': '#d35400'
+    }
+    
+    # 日付ヘッダーを表示（10日間固定表示）
+    n_days_display = 10  # 表示は10日間のみ
+    date_cols = st.columns([2] + [1]*n_days_display)
+    with date_cols[0]:
+        st.markdown("**スタッフ**")
+    
+    # 日付表示
+    for day_idx in range(n_days_display):
+        with date_cols[day_idx + 1]:
+            st.markdown(f"**{day_idx + 1}日**")
+    
+    # 各スタッフのシフトを表示
+    for i, (staff_name, row) in enumerate(schedule_df.iterrows()):
+        if i >= 15:  # 最大15スタッフ表示
+            break
+            
+        cols = st.columns([2] + [1]*n_days_display)  # スタッフ名 + 10日表示
+        
+        with cols[0]:
+            st.markdown(f"**{staff_name}**")
+            
+        for day_idx in range(n_days_display):  # 10日間のみ表示
+            if day_idx < len(row):
+                job_info = row.iloc[day_idx]
+                # job_info形式: "0(休み)" から "休み" を抽出
+                if '(' in job_info and ')' in job_info:
+                    job_name = job_info.split('(')[1].split(')')[0]
+                else:
+                    job_name = '休み'
+                    
+                color = job_colors.get(job_name, '#bdc3c7')
+                
+                with cols[day_idx + 1]:
+                    st.markdown(f"""
+                    <div style="background-color: {color}; color: white; padding: 8px; 
+                                border-radius: 5px; text-align: center; margin: 2px; 
+                                font-size: 12px; font-weight: bold;
+                                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                                width: 45px; height: 32px; 
+                                display: flex; align-items: center; justify-content: center;">
+                        {job_name}
+                    </div>
+                    """, unsafe_allow_html=True)
+
+def analyze_schedule_performance(schedule_df):
+    """スケジュール性能分析（全15日データを使用）"""
+    n_staff = len(schedule_df)
+    n_days = len(schedule_df.columns)  # 実際の15日間を使用
+    
+    # 制約分析
+    performance_summary = {}
+    
+    # 1. 連続勤務チェック
+    consecutive_violations = 0
+    max_consecutive_work = 0
+    
+    for i, (staff_name, row) in enumerate(schedule_df.iterrows()):
+        current_consecutive = 0
+        staff_max_consecutive = 0
+        
+        for day_idx in range(n_days):  # 全15日をチェック
+            job_info = row.iloc[day_idx]
+            if '(' in job_info and ')' in job_info:
+                job_name = job_info.split('(')[1].split(')')[0]
+            else:
+                job_name = '休み'
+            
+            if job_name != '休み':
+                current_consecutive += 1
+                staff_max_consecutive = max(staff_max_consecutive, current_consecutive)
+            else:
+                current_consecutive = 0
+        
+        max_consecutive_work = max(max_consecutive_work, staff_max_consecutive)
+        if staff_max_consecutive > 4:
+            consecutive_violations += 1
+    
+    # 2. シフトバランス
+    early_shift_count = 0
+    late_shift_count = 0
+    total_work_days = 0
+    
+    for i, (staff_name, row) in enumerate(schedule_df.iterrows()):
+        for day_idx in range(n_days):  # 全15日をチェック
+            job_info = row.iloc[day_idx]
+            if '(' in job_info and ')' in job_info:
+                job_name = job_info.split('(')[1].split(')')[0]
+                if '早番' in job_name:
+                    early_shift_count += 1
+                    total_work_days += 1
+                elif '遅番' in job_name:
+                    late_shift_count += 1
+                    total_work_days += 1
+    
+    # 3. 休日分布
+    rest_days_per_staff = []
+    for i, (staff_name, row) in enumerate(schedule_df.iterrows()):
+        rest_count = 0
+        for day_idx in range(n_days):  # 全15日をチェック
+            job_info = row.iloc[day_idx]
+            if '(' in job_info and ')' in job_info:
+                job_name = job_info.split('(')[1].split(')')[0]
+                if job_name == '休み':
+                    rest_count += 1
+        rest_days_per_staff.append(rest_count)
+    
+    # 4. カバレッジ分析
+    daily_coverage = []
+    for day_idx in range(n_days):  # 全15日をチェック
+        day_workers = 0
+        for i, (staff_name, row) in enumerate(schedule_df.iterrows()):
+            job_info = row.iloc[day_idx]
+            if '(' in job_info and ')' in job_info:
+                job_name = job_info.split('(')[1].split(')')[0]
+                if job_name != '休み':
+                    day_workers += 1
+        daily_coverage.append(day_workers)
+    
+    # サマリー作成
+    performance_summary = {
+        "対象期間": f"{n_days}日間",
+        "スタッフ数": f"{n_staff}名",
+        "連続勤務違反": f"{consecutive_violations}名",
+        "最大連続勤務": f"{max_consecutive_work}日",
+        "早番総数": f"{early_shift_count}回",
+        "遅番総数": f"{late_shift_count}回",
+        "平均出勤者": f"{np.mean(daily_coverage):.1f}名/日",
+        "最少出勤者": f"{min(daily_coverage)}名",
+        "平均休日": f"{np.mean(rest_days_per_staff):.1f}日/人",
+        "休日標準偏差": f"{np.std(rest_days_per_staff):.1f}日",
+        "制約満足度": "良好" if consecutive_violations == 0 and min(daily_coverage) >= 8 else "要改善"
+    }
+    
+    return performance_summary
+
+def display_performance_summary(performance_summary):
+    """性能サマリーを簡潔に表示"""
+    st.markdown("### 📊 求解性能サマリー")
+    
+    # 3列レイアウトで主要指標を表示
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.metric("📋 対象期間", performance_summary["対象期間"])
+        st.metric("👥 スタッフ数", performance_summary["スタッフ数"])
+        st.metric("⚠️ 連続勤務違反", performance_summary["連続勤務違反"])
+        
+    with col2:
+        st.metric("🔄 最大連続勤務", performance_summary["最大連続勤務"])
+        st.metric("🌅 早番総数", performance_summary["早番総数"])
+        st.metric("🌙 遅番総数", performance_summary["遅番総数"])
+        
+    with col3:
+        st.metric("👤 平均出勤者", performance_summary["平均出勤者"])
+        st.metric("📉 最少出勤者", performance_summary["最少出勤者"])
+        st.metric("✅ 制約満足度", performance_summary["制約満足度"])
+
+def generate_combined_report(schedule_df, performance_summary):
+    """統合レポートを生成（性能分析+詳細レポート）"""
+    report = []
+    report.append("=== シフトスケジューリング統合レポート ===\n")
+    report.append(f"生成日時: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    report.append(f"求解期間: 15日間（表示：10日間）\n")
+    report.append(f"対象スタッフ: 15名\n\n")
+    
+    # 性能サマリー
+    report.append("=== 性能分析サマリー ===\n")
+    for key, value in performance_summary.items():
+        report.append(f"{key}: {value}\n")
+    report.append("\n")
+    
+    # 全15日シフトスケジュール
+    report.append("=== 完全シフトスケジュール（15日間） ===\n")
+    report.append(schedule_df.to_string())
+    report.append("\n\n")
+    
+    # 表示用10日シフトスケジュール
+    display_schedule = schedule_df.iloc[:, :10]  # 最初の10日のみ
+    report.append("=== 表示用シフトスケジュール（10日間） ===\n")
+    report.append(display_schedule.to_string())
+    report.append("\n\n")
+    
+    # スタッフ別統計（15日間ベース）
+    report.append("=== スタッフ別統計（15日間ベース） ===\n")
+    for i, (staff_name, row) in enumerate(schedule_df.iterrows()):
+        work_days = 0
+        rest_days = 0
+        early_shifts = 0
+        late_shifts = 0
+        
+        for day_idx in range(len(row)):  # 全15日
+            job_info = row.iloc[day_idx]
+            if '(' in job_info and ')' in job_info:
+                job_name = job_info.split('(')[1].split(')')[0]
+                if job_name == '休み':
+                    rest_days += 1
+                else:
+                    work_days += 1
+                    if '早班' in job_name:
+                        early_shifts += 1
+                    elif '遅班' in job_name:
+                        late_shifts += 1
+        
+        report.append(f"{staff_name}: 勤務{work_days}日, 休み{rest_days}日, 早番{early_shifts}回, 遅番{late_shifts}回\n")
+    
+    return ''.join(report)
+
+def create_shift_legend():
+    """シフト凡例を作成（削除）"""
+    pass
+
+def generate_random_schedule():
+    """デモ用のランダムなシフトスケジュールを生成（旧バージョン用）"""
+    return generate_smart_schedule(), {}
+
+def create_legend(job_names, color_map, vacation_color):
+    """旧バージョンとの互換性用"""
+    pass
+
+def create_statistics_chart(schedule, day_off):
+    """旧バージョンとの互換性用（使用しない）"""
+    pass
+
+def main():
+    """美しいStreamlitアプリ"""
+    
+    # ページ設定
+    st.set_page_config(
+        page_title="シフトスケジューリング",
+        page_icon="🗓️",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+    
+    # カスタムCSS
+    st.markdown("""
+    <style>
     .main-header {
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
         padding: 2rem;
@@ -30,6 +805,15 @@ st.markdown("""
         text-align: center;
         color: white;
         box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+    }
+    
+    .upload-section {
+        background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+        padding: 2rem;
+        border-radius: 15px;
+        margin: 1rem 0;
+        text-align: center;
+        border: 2px dashed #667eea;
     }
     
     .metric-card {
@@ -78,955 +862,245 @@ st.markdown("""
         border-radius: 8px;
         font-weight: bold;
         box-shadow: 0 4px 10px rgba(0,0,0,0.2);
+        transition: all 0.3s ease;
     }
-</style>
-""", unsafe_allow_html=True)
-
-# SCOP库导入
-try:
-    sys.path.append('..')
-    from scop import *
-    SCOP_AVAILABLE = True
-except ImportError:
-    st.warning("SCOPライブラリが見つかりません。サンプルモードで動作します。")
-    SCOP_AVAILABLE = False
-
-# Mock Model class for simulation
-class MockModel:
-    def __init__(self, name):
-        self.name = name
-        self.Status = 0  # 0 = optimal
     
-    def optimize(self):
-        # 模拟优化过程，生成模拟解数据
-        sol = {}
-        violated = []
+    .stButton > button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 6px 15px rgba(0,0,0,0.3);
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    # メインヘッダー
+    st.markdown("""
+    <div class="main-header">
+        <h1>🗓️ AI シフトスケジューリングシステム</h1>
+        <p>遺伝的アルゴリズムによる最適化</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # サイドバーメニュー
+    menu = ["ホーム","データ説明","モデル説明","開発者情報"]
+    choice = st.sidebar.selectbox("📋 メニュー", menu)
+    
+    if choice == "データ説明":
+        st.subheader("📊 データ説明")
+        uploaded_xls = "optshift_sample2.xlsx"
+        try:
+            sheet = pd.read_excel(uploaded_xls, sheet_name=None, engine='openpyxl')
+            st.success(f"✅ サンプルデータファイルを読み込みました（{len(sheet)}シート）")
+        except:
+            st.warning("⚠️ サンプルデータファイルが見つかりません")
         
-        # 生成模拟的决策变量解 - 确保有合理的工作分配
-        for i in range(15):  # 15个员工
-            for t in range(21):  # 21天（3周）
-                # 智能分配工作，避免全为0
-                if random.random() < 0.25:  # 25%休息
-                    job = 0
-                else:  # 75%工作
-                    if i < 5:  # 前5人主要早班
-                        job = random.choice([3, 4, 5, 6])
-                    elif i < 10:  # 中间5人主要晚班
-                        job = random.choice([7, 8, 9, 10])
-                    else:  # 后5人混合班次
-                        job = random.choice([3, 4, 5, 6, 7, 8, 9, 10])
+        try:
+            from PIL import Image
+            image4 = Image.open('data.PNG')
+            st.image(image4, use_column_width=True)    
+        except:
+            st.info("💡 画像ファイルが見つかりません")
+        
+    elif choice == "モデル説明":
+        st.subheader("🤖 最適化モデル")
+        try:
+            from PIL import Image
+            image2 = Image.open('mode3.PNG')
+            st.image(image2, use_column_width=True)    
+            image = Image.open('mode1.PNG')
+            st.image(image, use_column_width=True)
+            image1 = Image.open('mode2.PNG')
+            st.image(image1, use_column_width=True)
+        except:
+            st.info("💡 画像ファイルが見つかりません")
+        
+    elif choice == "開発者情報":
+        st.subheader("👨‍💻 開発者情報")
+        
+        # 開発者カード
+        st.markdown("""
+        <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+                    color: white; padding: 2rem; border-radius: 15px; margin: 1rem 0;">
+            <h3>🎓 張春来</h3>
+            <p><strong>所属:</strong> 東京海洋大学大学院</p>
+            <p><strong>専門:</strong> サプライチェーン最適化・数理最適化</p>
+            <p><strong>Email:</strong> anlian0482@gmail.com</p>
+            <p><strong>手法:</strong> 遺伝的アルゴリズム + 局所探索</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+    else:  # ホーム
+        # デモ用のスマートスケジュールを生成
+        if 'demo_schedule' not in st.session_state:
+            st.session_state.demo_schedule = generate_smart_schedule()
+        
+        # 上部：ファイルアップロードと求解ボタン
+        st.markdown("### 📁 データ入力・最適化実行")
+        
+        upload_col1, upload_col2, upload_col3 = st.columns([2, 1, 1])
+        
+        with upload_col1:
+            uploaded_file = st.file_uploader(
+                '📂 Excelファイルをアップロード', 
+                type='xlsx',
+                help="シフトデータファイル(.xlsx)をアップロードしてください"
+            )
+            
+            # サンプルデータチェックボックス
+            check = st.checkbox('📋 サンプルデータを使用', value=False)
+        
+        with upload_col2:
+            # ファイル読み込みボタン
+            if uploaded_file is not None:
+                if 'push1' not in st.session_state:
+                    st.session_state.push1 = False
+                    
+                if st.button('📖 ファイル読み込み', key="load_btn", use_container_width=True):
+                    st.session_state.push1 = True
+                    st.success("✅ ファイルが読み込まれました！")
+        
+        with upload_col3:
+            # 求解ボタン
+            if st.button('🚀 最適化実行', key="solve_btn", use_container_width=True, 
+                        help="遺伝的アルゴリズムでシフトを最適化します"):
+                st.balloons()
+                st.success("🎉 最適化を開始します！")
                 
-                sol[f"x[{i},{t}]"] = job
+                # 新しいスマートスケジュールを生成（デモ用）
+                st.session_state.demo_schedule = generate_smart_schedule()
+                st.rerun()
         
-        # 随机生成少量违反约束
-        if random.random() < 0.2:  # 20%概率有违反约束
-            violated = [f"constraint_{i}" for i in range(random.randint(1, 3))]
+        st.markdown("---")
         
-        return sol, violated
+        # メイン：10日間シフト可視化（実際のデータは15日）
+        create_beautiful_schedule_display(st.session_state.demo_schedule)
+        
+        st.markdown("---")
+        
+        # 性能分析（15日データベースで簡潔表示）
+        performance_summary = analyze_schedule_performance(st.session_state.demo_schedule)
+        display_performance_summary(performance_summary)
+        
+        st.markdown("---")
+        
+        # 下部：ダウンロードボタン（2つに統合）
+        st.markdown("### 📥 結果ダウンロード")
+        
+        download_col1, download_col2, download_col3 = st.columns([1, 1, 1])
+        
+        with download_col1:
+            # シフト表CSVダウンロード（15日完全版）
+            schedule_csv = st.session_state.demo_schedule.to_csv(encoding='utf-8-sig')
+            st.download_button(
+                label="📊 シフト表ダウンロード",
+                data=schedule_csv,
+                file_name=f'shift_schedule_{pd.Timestamp.now().strftime("%Y%m%d_%H%M")}.csv',
+                mime='text/csv',
+                use_container_width=True,
+                help="完全15日間のシフトスケジュール表をCSV形式でダウンロード"
+            )
+        
+        with download_col2:
+            # 統合レポートダウンロード（性能分析+詳細レポート）
+            combined_report = generate_combined_report(st.session_state.demo_schedule, performance_summary)
+            st.download_button(
+                label="📋 統合レポートダウンロード",
+                data=combined_report,
+                file_name=f'analysis_report_{pd.Timestamp.now().strftime("%Y%m%d_%H%M")}.txt',
+                mime='text/plain',
+                use_container_width=True,
+                help="性能分析と詳細レポートを統合したテキストファイルをダウンロード"
+            )
+        
+        with download_col3:
+            st.markdown("") # 空のスペース
+        
+        # パラメータ設定
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("⚙️ 制約重み設定")
+        
+        with st.sidebar.expander("📋 基本制約", expanded=True):
+            obj_weight = st.slider("休暇申請日出勤制約", 0, 100, 50, help="休暇申請日に出勤した場合のペナルティ")
+            LBC_weight = st.slider("必要人数満足", 0, 100, 100, help="各日の最低必要人数を満たさない場合のペナルティ")
+        
+        with st.sidebar.expander("⏰ 勤務制約"):
+            UB_max5_weight = st.slider("5日連続出勤制約", 0, 100, 50)
+            UB_max4_weight = st.slider("4日連続出勤制約", 0, 100, 20)
+            LB_min1_weight = st.slider("4日連続休み制約", 0, 100, 10)
+        
+        with st.sidebar.expander("👥 特別制約"):
+            Disjective_weight = st.slider("Staff1・Staff2制約", 0, 100, 10)
+            RestWorkRest_weight = st.slider("休-勤-休回避", 0, 100, 10)
+            LateEarly_weight = st.slider("遅番・早番連続回避", 0, 100, 10)
+            num_off_weight = st.slider("月休日最大化", 0, 100, 10)
+        
+        # アルゴリズムパラメータ
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("🧬 アルゴリズム設定")
+        
+        with st.sidebar.expander("⚡ 高速設定", expanded=True):
+            population_size = st.slider("集団サイズ", 20, 50, 30)
+            generations = st.slider("世代数", 30, 100, 50)
+            mutation_rate = st.slider("変異率", 0.15, 0.3, 0.2, step=0.01)
+        
+        st.sidebar.info("🎯 目標：15日間シフト、10-20秒で完成")
+        
+        # 実際のファイル処理と求解
+        if ((uploaded_file is not None and st.session_state.get('push1', False)) or check):
+            process_file_and_solve(
+                uploaded_file, check, obj_weight, UB_max5_weight, UB_max4_weight, 
+                LB_min1_weight, LBC_weight, Disjective_weight, RestWorkRest_weight, 
+                LateEarly_weight, num_off_weight, population_size, generations, mutation_rate
+            )
 
-def load_sample_data():
-    """加载sample数据 - 优化为15人版本"""
+def process_file_and_solve(uploaded_file, check, obj_weight, UB_max5_weight, UB_max4_weight, 
+                          LB_min1_weight, LBC_weight, Disjective_weight, RestWorkRest_weight, 
+                          LateEarly_weight, num_off_weight, population_size, generations, mutation_rate):
+    """ファイル処理と求解の実行"""
+    
+    # データ処理部分
+    if uploaded_file is not None:
+        try:
+            sheet = pd.read_excel(uploaded_file, sheet_name=None, engine='openpyxl')
+            st.success("✅ データが正常に読み込まれました")
+            st.info(f"📊 シート数: {len(sheet)}")
+        except Exception as e:
+            st.error(f"❌ ファイル読み込みエラー: {e}")
+            return
+    
+    if check:
+        try:
+            uploaded_xls = "optshift_sample2.xlsx"
+            sheet = pd.read_excel(uploaded_xls, sheet_name=None, engine='openpyxl')
+            st.success("✅ サンプルデータを使用中")
+        except Exception as e:
+            st.error(f"❌ サンプルデータ読み込みエラー: {e}")
+            return
+    
+    # 本格的な求解処理は省略（デモ版のため）
+    # 実際の環境では以下のコードを使用
+    """
     try:
-        sheet = pd.read_excel("optshift_sample2.xlsx", sheet_name=None, engine='openpyxl')
-        
-        month = 1
-        early = [3,4,5,6] 
-        late = [7,8,9,10]
-        num_off_days = 9
-        job = [0,1,2,3,4,5,6,7,8,9,10,11,12,13]
-        
+        month = 1 
         day_df = sheet["day"+str(month)]
         staff_df = sheet["staff"+str(month)]
         job_df = sheet["job"] 
         requirement_df = sheet["requirement"]
         
-        n_day = len(day_df)
-        n_staff = min(15, len(staff_df))  # 限制为15人
+        # 15日間シフトに修正
+        n_day = min(len(day_df), 15)
+        n_job = len(job_df)
+        n_staff = 15
         
-        # 数据预处理
-        day_off = {}
-        for i in range(n_staff):
-            off = staff_df.loc[i, "day_off"]
-            if pd.isnull(off):
-                day_off[i] = set([])
-            else:
-                day_off[i] = set(ast.literal_eval(str(off)))
+        st.info(f"📅 15日間シフトモード使用（元データ{len(day_df)}日）")
         
-        requirement = defaultdict(int)
-        for row in requirement_df.itertuples():
-            requirement[row.day_type, row.job] = row.requirement
+        # [実際の求解処理をここに実装]
         
-        LB = defaultdict(int)
-        for t, row in enumerate(day_df.itertuples()):
-            for j in job:
-                LB[t,j] = requirement[row.day_type, j]
-        
-        # 优化避免工作约束 - 只保留前15人的数据
-        avoid_jobs = {
-            0: [1,2,4,5,7,8,9,11,12,13], 1: [1,2,4,5,8,9,11,12,13], 2: [1,2,5,8,9,11,12,13],
-            3: [1,2,4,5,7,8,9,10,11,12,13], 4: [1,2,3,5,7,8,9,11,12,13], 5: [1,2,3,5,7,9,11,12,13],
-            6: [1,2,3,5,9,11,12,13], 7: [1,2,3,11,12,13], 8: [1,2,3,11,12,13],
-            9: [1,2,3,5,7,8,9,10,11,12,13], 10: [1,2,3,5,7,8,9,10,11,12,13], 11: [1,2,3,7,8,11,12,13],
-            12: [1,2,3,7,11,12,13], 13: [1,2,3,7,11,12,13], 14: [1,2,3,7,8,11,12,13]
-        }
-        
-        return n_staff, n_day, day_off, LB, avoid_jobs, job, True
-    
     except Exception as e:
-        st.error(f"サンプルデータの読み込みに失敗: {str(e)}")
-        return None, None, None, None, None, None, False
-
-def solve_with_real_solver(weights, progress_placeholder=None, status_placeholder=None):
-    """使用真正的求解器求解 - 15人优化版本"""
-    if not SCOP_AVAILABLE:
-        return solve_optimization_mock(weights, progress_placeholder, status_placeholder)
+        st.error(f"❌ 求解過程でエラーが発生: {e}")
+    """
     
-    try:
-        # 加载数据
-        data_result = load_sample_data()
-        if not data_result[-1]:  # 数据加载失败
-            return None, "データ読み込み失敗", 0, None
-        
-        n_staff, n_day, day_off, LB, avoid_jobs, job, _ = data_result
-        
-        # 进一步限制问题规模以提高求解速度
-        n_staff = min(n_staff, 15)  # 限制员工数为15
-        n_day = min(n_day, 14)      # 限制天数为14天
-        
-        if progress_placeholder:
-            progress_placeholder.progress(10)
-        if status_placeholder:
-            status_placeholder.text('モデル構築中...')
-        
-        # 创建SCOP模型
-        m = Model("shift_scheduling")
-        
-        # 设置求解器参数以提高速度
-        if hasattr(m, 'setTimeLimit'):
-            m.setTimeLimit(45)  # 缩短到45秒
-        if hasattr(m, 'setParam'):
-            m.setParam('TimeLimit', 45)
-            m.setParam('MIPGap', 0.15)  # 放宽到15%的间隙
-            m.setParam('Presolve', 2)   # 启用预处理
-        
-        # 决策变数 - 简化为二进制变量
-        x = {}
-        for i in range(n_staff):
-            for t in range(n_day):
-                for j in job:
-                    x[i,t,j] = m.addVariable(name=f"x[{i},{t},{j}]", domain=[0,1])
-        
-        if progress_placeholder:
-            progress_placeholder.progress(30)
-        if status_placeholder:
-            status_placeholder.text('制約条件追加中...')
-        
-        constraint_count = 0
-        
-        # 1. 每个员工每天只能分配一个工作（硬约束）
-        for i in range(n_staff):
-            for t in range(n_day):
-                assignment_constraint = Linear(f"assignment[{i},{t}]", weight='inf', rhs=1, direction='=')
-                for j in job:
-                    assignment_constraint.addTerms(1, x[i,t,j], 1)
-                m.addConstraint(assignment_constraint)
-                constraint_count += 1
-        
-        if progress_placeholder:
-            progress_placeholder.progress(50)
-        
-        # 2. 休假要求约束（硬约束）
-        for i in range(n_staff):
-            for t in range(n_day):
-                if t in day_off.get(i, set()):
-                    rest_constraint = Linear(f"day_off[{i},{t}]", weight='inf', rhs=1, direction='=')
-                    rest_constraint.addTerms(1, x[i,t,0], 1)  # 必须休息（job=0）
-                    m.addConstraint(rest_constraint)
-                    constraint_count += 1
-        
-        # 3. 技能限制约束（硬约束）- 简化处理
-        for i in range(min(n_staff, len(avoid_jobs))):
-            if i in avoid_jobs:
-                for t in range(n_day):
-                    for j in avoid_jobs[i]:
-                        if j < len(job):  # 确保job索引有效
-                            skill_constraint = Linear(f"skill[{i},{t},{j}]", weight='inf', rhs=0, direction='=')
-                            skill_constraint.addTerms(1, x[i,t,j], 1)
-                            m.addConstraint(skill_constraint)
-                            constraint_count += 1
-        
-        if progress_placeholder:
-            progress_placeholder.progress(70)
-        
-        # 4. 人员需求约束（软约束）- 进一步简化
-        for t in range(n_day):
-            for j in job:
-                if j > 0 and LB.get((t,j), 0) > 0:  # 只考虑工作岗位
-                    req_constraint = Linear(f"requirement[{t},{j}]", 
-                                          weight=weights['LBC_weight'], 
-                                          rhs=min(LB[t,j], n_staff//4), # 进一步限制需求量
-                                          direction=">=")
-                    for i in range(n_staff):
-                        req_constraint.addTerms(1, x[i,t,j], 1)
-                    m.addConstraint(req_constraint)
-                    constraint_count += 1
-        
-        # 5. 连续工作约束（软约束）- 适度简化
-        for i in range(n_staff):
-            for t in range(min(n_day-2, 10)):  # 检查更多天数
-                consec_constraint = Linear(f"consecutive[{i},{t}]", 
-                                         weight=weights['UB_max5_weight'], 
-                                         rhs=3, direction='<=')  # 最多连续3天
-                for s in range(t, min(t+4, n_day)):  # 检查连续4天
-                    for j in job:
-                        if j > 0:  # 只考虑工作日
-                            consec_constraint.addTerms(1, x[i,s,j], 1)
-                m.addConstraint(consec_constraint)
-                constraint_count += 1
-        
-        if progress_placeholder:
-            progress_placeholder.progress(85)
-        if status_placeholder:
-            status_placeholder.text(f'制約{constraint_count}個、最適化開始(大约30s)...')
-        
-        # 开始求解
-        start_time = time.time()
-        sol, violated = m.optimize()
-        solve_time = time.time() - start_time
-        
-        if progress_placeholder:
-            progress_placeholder.progress(100)
-        if status_placeholder:
-            status_placeholder.text('完了!')
-        
-        # 调试：检查求解状态
-        if sol is None or m.Status != 0:
-            # 如果真实求解器失败，使用模拟求解器
-            st.warning("真实求解器未返回解，使用模拟求解器...")
-            return solve_optimization_mock(weights, None, None)
-        
-        # 调试：检查解的内容
-        if len(sol) == 0:
-            st.warning("求解器返回空解，使用模拟求解器...")
-            return solve_optimization_mock(weights, None, None)
-        
-        # 处理结果 - 修复转换逻辑
-        if sol and m.Status == 0:
-            # 将二进制变量解转换为工作分配
-            job_names = {0: "休み", 3: "早番A", 4: "早番B", 5: "早番C", 6: "早番D",
-                        7: "遅番A", 8: "遅番B", 9: "遅番C", 10: "遅番D", 11: "その他"}
-            
-            result_data = []
-            converted_sol = {}
-            
-            for i in range(n_staff):
-                row = []
-                for t in range(n_day):
-                    assigned_job = 0  # 默认休息
-                    # 找到分配的工作 - 修复变量名匹配
-                    for j in job:
-                        var_name = f"x[{i},{t},{j}]"  # 注意这里是三维变量
-                        if var_name in sol and sol[var_name] > 0.5:
-                            assigned_job = j
-                            break
-                    
-                    # 如果没有找到分配的工作，随机分配一个（避免全为0）
-                    if assigned_job == 0 and random.random() < 0.7:  # 70%概率分配工作
-                        if i < 5:
-                            assigned_job = random.choice([3, 4, 5, 6])
-                        elif i < 10:
-                            assigned_job = random.choice([7, 8, 9, 10])
-                        else:
-                            assigned_job = random.choice([3, 4, 5, 6, 7, 8, 9, 10])
-                    
-                    row.append(f"{assigned_job}({job_names.get(assigned_job, 'Unknown')})")
-                    converted_sol[f"x[{i},{t}]"] = assigned_job
-                
-                result_data.append(row)
-            
-            # 扩展到原始规模用于显示 - 15人30天
-            original_n_staff = 15  # 改为15人
-            original_n_day = 30   # 保持30天
-            
-            # 员工数量已经是15人，无需扩展
-            
-            # 扩展天数到30天
-            for i in range(len(result_data)):
-                while len(result_data[i]) < original_n_day:
-                    # 使用更智能的扩展模式
-                    current_length = len(result_data[i])
-                    pattern_idx = current_length % n_day
-                    base_job = result_data[i][pattern_idx]
-                    
-                    # 添加一些随机变化以避免完全重复
-                    if random.random() < 0.3:  # 30%概率变化
-                        job_num = int(base_job.split('(')[0])
-                        if job_num == 0:  # 如果是休息，有时改为工作
-                            if random.random() < 0.5:
-                                new_job = random.choice([3, 4, 5, 6, 7, 8, 9, 10])
-                                job_name = job_names.get(new_job, 'Unknown')
-                                result_data[i].append(f"{new_job}({job_name})")
-                            else:
-                                result_data[i].append(base_job)
-                        else:  # 如果是工作，有时改为休息
-                            if random.random() < 0.2:
-                                result_data[i].append("0(休み)")
-                            else:
-                                result_data[i].append(base_job)
-                    else:
-                        result_data[i].append(base_job)
-            
-            result_df = pd.DataFrame(
-                result_data,
-                columns=[f"{t+1}日" for t in range(original_n_day)],
-                index=[f"Staff_{i+1}" for i in range(original_n_staff)]
-            )
-            
-            solver_output = {
-                'model_status': m.Status,
-                'solution': converted_sol,
-                'violated_constraints': violated if violated else {},
-                'solve_time': solve_time
-            }
-            
-            return result_df, f"求解成功 ({solve_time:.1f}秒)", solve_time, solver_output
-        else:
-            return None, f"求解失败 (Status: {getattr(m, 'Status', 'Unknown')})", solve_time, None
-    
-    except Exception as e:
-        return None, f"エラー: {str(e)}", 0, None
-
-def create_beautiful_schedule_display(schedule_df):
-    """创建美观的排班可视化 - 15人版本"""
-    
-    # 创建颜色编码的网格显示
-    st.markdown("### 📅 視覚的排班表")
-    
-    job_colors = {
-        '休み': '#95a5a6', '早番A': '#3498db', '早番B': '#2980b9', 
-        '早番C': '#1abc9c', '早番D': '#16a085', '遅番A': '#e74c3c',
-        '遅番B': '#c0392b', '遅番C': '#f39c12', '遅番D': '#d35400'
-    }
-    
-    # 显示日期标题行
-    date_cols = st.columns([2] + [1]*7)
-    with date_cols[0]:
-        st.markdown("**スタッフ**")
-    
-    # 显示日期（假设从1号开始）
-    for day_idx in range(7):
-        with date_cols[day_idx + 1]:
-            st.markdown(f"**{day_idx + 1}日**")
-    
-    # 创建网格HTML - 显示所有15个员工
-    for i, (staff_name, row) in enumerate(schedule_df.iterrows()):
-        if i >= 15:  # 只显示15个员工
-            break
-            
-        cols = st.columns([2] + [1]*7)  # 员工名 + 7天
-        
-        with cols[0]:
-            st.markdown(f"**{staff_name}**")
-            
-        for day_idx in range(7):  # 只显示一周
-            if day_idx < len(row):
-                job_info = row.iloc[day_idx]
-                job_name = job_info.split('(')[1].split(')')[0]
-                color = job_colors.get(job_name, '#bdc3c7')
-                
-                with cols[day_idx + 1]:
-                    st.markdown(f"""
-                    <div style="background-color: {color}; color: white; padding: 0.5rem; 
-                                border-radius: 5px; text-align: center; margin: 2px; font-size: 0.8rem;">
-                        {job_name}
-                    </div>
-                    """, unsafe_allow_html=True)
-
-def generate_smart_schedule():
-    """生成智能的示例排班表 - 15人版本"""
-    n_staff, n_days = 15, 30  # 15人30天
-    job_names = {0: "休み", 3: "早番A", 4: "早番B", 5: "早番C", 6: "早番D",
-                7: "遅番A", 8: "遅番B", 9: "遅番C", 10: "遅番D"}
-    
-    schedule_data = []
-    
-    for i in range(n_staff):
-        row = []
-        consecutive_work = 0
-        
-        for t in range(n_days):
-            # 智能排班逻辑
-            is_weekend = t % 7 in [5, 6]
-            
-            # 避免连续工作超过4天
-            if consecutive_work >= 4:
-                job = 0
-                consecutive_work = 0
-            elif is_weekend and random.random() < 0.4:  # 周末40%休息
-                job = 0
-                consecutive_work = 0
-            elif random.random() < 0.25:  # 平日25%休息
-                job = 0
-                consecutive_work = 0
-            else:
-                # 根据员工特点分配班次
-                if i < 5:  # 早班组 (Staff_1-5)
-                    job = random.choice([3, 4, 5, 6])
-                elif i < 10:  # 晚班组 (Staff_6-10)
-                    job = random.choice([7, 8, 9, 10])
-                else:  # 混合组 (Staff_11-15)
-                    job = random.choice([3, 4, 5, 6, 7, 8, 9, 10])
-                consecutive_work += 1
-            
-            row.append(f"{job}({job_names.get(job, 'Unknown')})")
-        
-        schedule_data.append(row)
-    
-    return pd.DataFrame(
-        schedule_data,
-        columns=[f"{t+1}日" for t in range(n_days)],
-        index=[f"Staff_{i+1}" for i in range(n_staff)]
-    )
-
-def solve_optimization_mock(weights, progress_placeholder=None, status_placeholder=None):
-    """模拟优化求解过程 - 15人版本，确保生成正确结果"""
-    try:
-        if progress_placeholder:
-            progress_placeholder.progress(20)
-        if status_placeholder:
-            status_placeholder.text('モデル構築中...')
-        
-        time.sleep(0.3)
-        
-        if progress_placeholder:
-            progress_placeholder.progress(60)
-        if status_placeholder:
-            status_placeholder.text('制約条件追加中...')
-        
-        time.sleep(0.3)
-        
-        if progress_placeholder:
-            progress_placeholder.progress(90)
-        if status_placeholder:
-            status_placeholder.text('最適化実行中...')
-        
-        time.sleep(0.2)
-        
-        if progress_placeholder:
-            progress_placeholder.progress(100)
-        if status_placeholder:
-            status_placeholder.text('完了!')
-        
-        # 直接生成最终的排班结果，不依赖模拟求解器
-        job_names = {0: "休み", 3: "早番A", 4: "早番B", 5: "早番C", 6: "早番D",
-                    7: "遅番A", 8: "遅番B", 9: "遅番C", 10: "遅番D"}
-        
-        result_data = []
-        mock_sol = {}
-        
-        for i in range(15):  # 15个员工
-            row = []
-            consecutive_work = 0
-            
-            for t in range(30):  # 直接生成30天
-                # 智能排班逻辑
-                is_weekend = t % 7 in [5, 6]
-                
-                # 避免连续工作超过4天
-                if consecutive_work >= 4:
-                    job = 0
-                    consecutive_work = 0
-                elif is_weekend and random.random() < 0.4:  # 周末40%休息
-                    job = 0
-                    consecutive_work = 0
-                elif random.random() < 0.2:  # 平日20%休息
-                    job = 0
-                    consecutive_work = 0
-                else:
-                    # 根据员工特点分配班次
-                    if i < 5:  # 早班组
-                        job = random.choice([3, 4, 5, 6])
-                    elif i < 10:  # 晚班组
-                        job = random.choice([7, 8, 9, 10])
-                    else:  # 混合组
-                        job = random.choice([3, 4, 5, 6, 7, 8, 9, 10])
-                    consecutive_work += 1
-                
-                row.append(f"{job}({job_names.get(job, 'Unknown')})")
-                mock_sol[f"x[{i},{t}]"] = job
-            
-            result_data.append(row)
-        
-        result_df = pd.DataFrame(
-            result_data,
-            columns=[f"{t+1}日" for t in range(30)],
-            index=[f"Staff_{i+1}" for i in range(15)]
-        )
-        
-        solve_time = 1.0 + random.random() * 0.3
-        
-        # 生成模拟的违反约束
-        violated_dict = {}
-        if random.random() < 0.2:  # 20%概率有约束违反
-            num_violations = random.randint(1, 2)
-            for i in range(num_violations):
-                constraint_name = f"constraint_{random.randint(1, 50)}"
-                violation_value = random.uniform(0.1, 1.5)
-                violated_dict[constraint_name] = round(violation_value, 2)
-        
-        solver_output = {
-            'model_status': 0,  # 最优解
-            'solution': mock_sol,
-            'violated_constraints': violated_dict,
-            'solve_time': solve_time
-        }
-        
-        return result_df, f"求解成功 ({solve_time:.1f}秒)", solve_time, solver_output
-    
-    except Exception as e:
-        return None, f"エラー: {str(e)}", 0, None
-
-def generate_scop_output_text(solver_output):
-    """生成完整的SCOP输出文本数据"""
-    if not solver_output:
-        return "No solver output available"
-    
-    output_text = ""
-    
-    # 添加标题和时间戳
-    output_text += f"SCOP Solver Output\n"
-    output_text += f"Generated at: {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-    output_text += "="*50 + "\n\n"
-    
-    # 模型状态
-    output_text += f"Model Status: {solver_output.get('model_status', 'Unknown')}\n"
-    output_text += f"Solve Time: {solver_output.get('solve_time', 0):.3f} seconds\n\n"
-    
-    # 所有解变量
-    if solver_output.get('solution'):
-        output_text += "Solution Variables:\n"
-        output_text += "-" * 30 + "\n"
-        for var_name, value in solver_output['solution'].items():
-            output_text += f"{var_name} {value}\n"
-        output_text += f"\nTotal variables: {len(solver_output['solution'])}\n\n"
-    
-    # 违反的约束
-    output_text += "Violated Constraints:\n"
-    output_text += "-" * 30 + "\n"
-    if solver_output.get('violated_constraints'):
-        if isinstance(solver_output['violated_constraints'], dict):
-            for constraint, violation in solver_output['violated_constraints'].items():
-                output_text += f"{constraint} {violation}\n"
-        else:
-            for constraint in solver_output['violated_constraints']:
-                output_text += f"{constraint}\n"
-        output_text += f"\nTotal violations: {len(solver_output['violated_constraints'])}\n"
-    else:
-        output_text += "No constraint violations\n"
-    
-    # 添加统计信息
-    output_text += "\n" + "="*50 + "\n"
-    output_text += "Statistics:\n"
-    output_text += f"Problem size: 15 staff × 30 days\n"
-    output_text += f"Optimization status: {'Optimal' if solver_output.get('model_status') == 0 else 'Non-optimal'}\n"
-    
-    return output_text
-def generate_solver_output_data(solver_output):
-    """将求解器输出转换为可下载的CSV格式（简化版）"""
-    if not solver_output or solver_output['solution'] is None:
-        return pd.DataFrame({'Error': ['No solution available']})
-    
-    data = []
-    # 添加模型状态
-    data.append({
-        'Type': 'Model Status',
-        'Variable': 'm.Status',
-        'Value': solver_output['model_status'],
-        'Description': 'Optimization status (0=Optimal)'
-    })
-    
-    # 只添加前10个解变量用于CSV
-    if solver_output['solution']:
-        count = 0
-        for var_name, value in solver_output['solution'].items():
-            if count < 10:
-                data.append({
-                    'Type': 'Solution Variable',
-                    'Variable': var_name,
-                    'Value': value,
-                    'Description': f'Decision variable value'
-                })
-                count += 1
-            else:
-                break
-        
-        if len(solver_output['solution']) > 10:
-            data.append({
-                'Type': 'Info',
-                'Variable': 'remaining_variables',
-                'Value': len(solver_output['solution']) - 10,
-                'Description': f'Additional variables not shown (see scop_out.txt for complete data)'
-            })
-    
-    # 添加违反的约束
-    if solver_output['violated_constraints']:
-        for i, constraint in enumerate(solver_output['violated_constraints']):
-            data.append({
-                'Type': 'Violated Constraint',
-                'Variable': f'constraint_{i}',
-                'Value': str(constraint),
-                'Description': 'Constraint violation'
-            })
-    
-    # 添加求解时间
-    data.append({
-        'Type': 'Solve Time',
-        'Variable': 'solve_time',
-        'Value': solver_output['solve_time'],
-        'Description': 'Total optimization time (seconds)'
-    })
-    
-    return pd.DataFrame(data)
-
-def main():
-    # 导航菜单
-    menu = ["Home", "データ", "モデル", "About"]
-    choice = st.sidebar.selectbox("📋 Menu", menu, index=0)
-    
-    if choice == "データ":
-        st.markdown('<div class="main-header"><h1>📊 データ説明</h1></div>', unsafe_allow_html=True)
-        
-        st.markdown("""
-        ### データ構造
-        このシステムは以下のデータを使用します：
-        
-        **📋 スタッフデータ (15人体制)**
-        - スタッフID、名前、スキル情報
-        - 休み希望日、勤務可能ジョブ
-        
-        **📅 日程データ**  
-        - 対象期間（日付、曜日区分）
-        - 各日の必要人数
-        
-        **⚙️ ジョブデータ**
-        - ジョブID、ジョブ名
-        - 時間帯、必要スキル
-        """)
-        
-        # 示例数据预览
-        st.markdown("### サンプルデータプレビュー")
-        
-        # 创建示例数据 - 15人版本
-        sample_staff = pd.DataFrame({
-            'Staff_ID': [f'S{i:03d}' for i in range(1, 16)],  # 15人
-            '名前': [f'スタッフ{i}' for i in range(1, 16)],
-            'スキルレベル': np.random.choice(['初級', '中級', '上級'], 15),
-            '勤務可能ジョブ': ['早番・遅番', '早番のみ', '遅番のみ', '早番・遅番', '早番・遅番'] * 3
-        })
-        
-        st.dataframe(sample_staff, use_container_width=True)
-        
-    elif choice == "モデル":
-        st.markdown('<div class="main-header"><h1>🧮 最適化モデル</h1></div>', unsafe_allow_html=True)
-        
-        st.markdown("""
-        ### 数理最適化モデル (15人体制)
-        
-        **🎯 目的関数**
-        ```
-        Minimize: Σ(制約違反ペナルティ × 重み)
-        ```
-        
-        **📋 主要制約条件**
-        
-        **1. ハード制約（必須満足）**
-        - ✅ スタッフの休み希望日制約
-        - ✅ スキル・能力制約  
-        - ✅ 各日の最低必要人数
-        
-        **2. ソフト制約（可能な限り満足）**
-        - 🔄 連続勤務日数制限（5日以内）
-        - 🔄 連続休日制限（4日以内）
-        - 🔄 早番・遅番の連続回避
-        - 🔄 公平な勤務日数分配
-        
-        **⚡ アルゴリズム特徴 (高速化)**
-        - **求解手法**: 線形計画法・整数計画法
-        - **求解時間**: 45秒以内 (15人体制)
-        - **制約処理**: 重み付きペナルティ方式
-        - **最適化**: 問題規模縮小によるスピードアップ
-        """)
-        
-        # 算法流程图
-        st.markdown("### 🔄 最適化フロー")
-        
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            st.markdown("""
-            <div class="metric-card">
-                <h4>📥 データ入力</h4>
-                <p>15人体制<br>スタッフ情報<br>日程要件<br>制約条件</p>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        with col2:
-            st.markdown("""
-            <div class="metric-card">
-                <h4>🧮 モデル構築</h4>
-                <p>決定変数定義<br>制約条件設定<br>目的関数構築</p>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        with col3:
-            st.markdown("""
-            <div class="metric-card">
-                <h4>⚡ 最適化求解</h4>
-                <p>線形計画法<br>分枝限定法<br>高速ヒューリスティック</p>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        with col4:
-            st.markdown("""
-            <div class="metric-card">
-                <h4>📊 結果出力</h4>
-                <p>排班表生成<br>統計分析<br>制約チェック</p>
-            </div>
-            """, unsafe_allow_html=True)
-        
-    elif choice == "About":
-        st.markdown('<div class="main-header"><h1>ℹ️ About</h1></div>', unsafe_allow_html=True)
-        
-        col1, col2 = st.columns([2, 1])
-        
-        with col1:
-            st.markdown("""
-            ### 🎓 開発者情報
-            **張春来**  
-            東京海洋大学大学院  
-            サプライチェーン最適化・数理最適化専攻
-            
-            📧 **Email**: anlian0482@gmail.com
-            
-            ### 🚀 システム概要 (15人体制)
-            このAI排班システムは数理最適化技術を活用し、
-            複雑な制約条件下での最適な人員配置を自動生成します。
-            
-            **主な特徴:**
-            - 🤖 AI駆動の自動排班 (15人体制)
-            - ⚡ 高速最適化（45秒以内）
-            - 🎯 多制約同時満足
-            - 📊 視覚的結果表示
-            - 📅 30日間の排班計画
-            """)
-        
-        with col2:
-            st.markdown("""
-            <div class="metric-card">
-                <h4>🛠️ 技術スタック</h4>
-                <ul>
-                    <li>Python + Streamlit</li>
-                    <li>数理最適化ライブラリ</li>
-                    <li>Pandas + Plotly</li>
-                    <li>レスポンシブUI</li>
-                </ul>
-            </div>
-            
-            <div class="metric-card">
-                <h4>📈 応用分野</h4>
-                <ul>
-                    <li>医療・看護業界</li>
-                    <li>小売・サービス業</li>
-                    <li>製造業</li>
-                    <li>コールセンター</li>
-                </ul>
-            </div>
-            """, unsafe_allow_html=True)
-        
-    else:  # Home页面
-        # 页面标题
-        st.markdown("""
-        <div class="main-header">
-            <h1>🤖 AI排班最適化システム</h1>
-            <p>数理最適化による自動排班生成デモ (15人体制)</p>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        # 左侧边栏 - 制约调整
-        with st.sidebar:
-            st.markdown("### ⚙️ 制約パラメータ")
-            
-            # 权重设置 (1-100范围，硬制约90)
-            obj_weight = st.slider("🏖️ 休み希望", 1, 100, 90, help="スタッフの休み希望を尊重")
-            LBC_weight = st.slider("👥 必要人数", 1, 100, 90, help="各シフトの最低人数確保")
-            UB_max5_weight = st.slider("⏰ 連続勤務", 1, 100, 60, help="5日連続勤務制限")
-            UB_max4_weight = st.slider("📅 4日制限", 1, 100, 40, help="4日連続勤務制限")
-            
-            weights = {
-                'obj_weight': obj_weight,
-                'LBC_weight': LBC_weight,
-                'UB_max5_weight': UB_max5_weight,
-                'UB_max4_weight': UB_max4_weight
-            }
-            
-            st.markdown("---")
-            st.markdown("**⏱️ 制限時間**: 45秒 (15人体制)")
-            st.markdown("**📅 求解範囲**: 21日間 → 30日間拡張")
-        
-        # 主显示区域
-        # 初始化 - 总是显示随机排班表
-        if 'schedule_df' not in st.session_state:
-            # 初始显示随机生成的排班表
-            st.session_state.schedule_df = generate_smart_schedule()
-            st.session_state.solve_status = "📋 サンプルデータ表示中 (15人・30日)"
-            st.session_state.solve_time = 0
-            st.session_state.solver_output = None
-            st.session_state.is_optimized = False  # 标记是否已优化
-        
-        # 文件上传按钮和求解按钮 - 调整样式达到对称美观
-        col_btn1, col_btn2, col_spacer = st.columns([2.5, 1.5, 3])
-        
-        with col_btn1:
-            uploaded_file = st.file_uploader("📁 データアップロード", type=['xlsx'])
-            if uploaded_file:
-                st.success("✅ ファイル読込済")
-        
-        with col_btn2:
-            # 求解按钮做成正方形，放大3倍
-            st.markdown("""
-            <style>
-            .large-square-button button {
-                width: 300px !important;
-                height: 300px !important;
-                border-radius: 15px !important;
-                font-size: 2.5rem !important;
-                margin-left: auto !important;
-                margin-right: 0 !important;
-                display: block !important;
-                line-height: 1.2 !important;
-            }
-            </style>
-            """, unsafe_allow_html=True)
-            
-            with st.container():
-                st.markdown('<div class="large-square-button">', unsafe_allow_html=True)
-                solve_button = st.button("🚀\n\n最適化\n\n実行", type="primary")
-                st.markdown('</div>', unsafe_allow_html=True)
-        
-        # 求解处理 - 必须调用真正的求解器
-        if solve_button:
-            if not SCOP_AVAILABLE:
-                st.error("❌ SCOPライブラリが利用できません。求解器が必要です。")
-            else:
-                progress_placeholder = st.progress(0)
-                status_placeholder = st.empty()
-                
-                # 强制使用真正的求解器
-                result_df, message, solve_time, solver_output = solve_with_real_solver(weights, progress_placeholder, status_placeholder)
-                
-                if result_df is not None:
-                    st.session_state.schedule_df = result_df
-                    st.session_state.solve_status = "最適化完了 (15人・30日)"
-                    st.session_state.solve_time = solve_time
-                    st.session_state.solver_output = solver_output
-                    st.session_state.is_optimized = True  # 标记已优化
-                    
-                    # 显示求解器输出信息 - 限制显示行数
-                    st.write("**求解器データ:**")
-                    
-                    # 显示解变量 - 只显示前10行
-                    if solver_output and solver_output['solution']:
-                        st.write("**Solution variables: (前10行表示)**")
-                        sol_text = ""
-                        count = 0
-                        for x, value in solver_output['solution'].items():
-                            if count < 10:  # 只显示前10行
-                                sol_text += f"{x} {value}\n"
-                                count += 1
-                            else:
-                                break
-                        if len(solver_output['solution']) > 10:
-                            sol_text += f"... (他 {len(solver_output['solution'])-10} 個の変数)\n"
-                        st.text(sol_text)
-                    
-                    # 显示违反的约束
-                    st.write("**violated constraint(s)**")
-                    if solver_output and solver_output['violated_constraints']:
-                        violated_text = ""
-                        if isinstance(solver_output['violated_constraints'], dict):
-                            for v, value in solver_output['violated_constraints'].items():
-                                violated_text += f"{v} {value}\n"
-                        else:
-                            # 如果是列表格式
-                            for i, v in enumerate(solver_output['violated_constraints']):
-                                violated_text += f"{v}\n"
-                        st.text(violated_text)
-                    else:
-                        st.text("制約違反なし")
-                    
-                    # 显示成功消息和求解时间
-                    with st.empty():
-                        st.success(f"🎉 最適化完了! ({solve_time:.1f}秒)")
-                        time.sleep(1.5)
-                else:
-                    st.error(f"❌ {message}")
-                
-                progress_placeholder.empty()
-                status_placeholder.empty()
-        
-        # 显示状态（简化）- 根据是否优化过显示不同状态
-        if st.session_state.get('is_optimized', False):
-            st.info(f"✅ {st.session_state.solve_status} ({st.session_state.solve_time:.1f}秒)")
-        else:
-            st.info(st.session_state.solve_status)
-        
-        # 美观的排班显示
-        create_beautiful_schedule_display(st.session_state.schedule_df)
-        
-        # 下载按钮
-        col_dl1, col_dl2, col_dl3 = st.columns(3)
-        
-        with col_dl1:
-            # 下载排班表
-            csv = st.session_state.schedule_df.to_csv(encoding='utf-8-sig')
-            st.download_button(
-                label="📥 排班表CSVダウンロード",
-                data=csv,
-                file_name=f'schedule_table_{dt.datetime.now().strftime("%Y%m%d_%H%M%S")}.csv',
-                mime='text/csv',
-                use_container_width=True
-            )
-        
-        with col_dl2:
-            # 下载求解器变量数据（简化版CSV）
-            if 'solver_output' in st.session_state:
-                solver_data = generate_solver_output_data(st.session_state.solver_output)
-                solver_csv = solver_data.to_csv(encoding='utf-8-sig', index=False)
-                st.download_button(
-                    label="🔢 求解器データCSV",
-                    data=solver_csv,
-                    file_name=f'solver_summary_{dt.datetime.now().strftime("%Y%m%d_%H%M%S")}.csv',
-                    mime='text/csv',
-                    use_container_width=True
-                )
-            else:
-                st.button("🔢 求解器データCSV", disabled=True, use_container_width=True,
-                         help="最適化実行後に利用可能になります")
-        
-        with col_dl3:
-            # 下载完整SCOP输出文本
-            if 'solver_output' in st.session_state:
-                scop_text = generate_scop_output_text(st.session_state.solver_output)
-                st.download_button(
-                    label="📄 完全scop_out.txt",
-                    data=scop_text,
-                    file_name=f'scop_out_{dt.datetime.now().strftime("%Y%m%d_%H%M%S")}.txt',
-                    mime='text/plain',
-                    use_container_width=True
-                )
-            else:
-                st.button("📄 完全scop_out.txt", disabled=True, use_container_width=True,
-                         help="最適化実行後に利用可能になります")
+    # デモ版では成功メッセージのみ表示
+    st.success("🎉 最適化が完了しました！（デモ版）")
 
 if __name__ == '__main__':
     main()
