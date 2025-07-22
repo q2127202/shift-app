@@ -17,9 +17,10 @@ import json
 import sys
 import time
 import copy
+import io
 sys.path.append('..')
 
-# 遗传算法+局部搜索类
+# 遺伝的アルゴリズム+局所探索クラス
 class GeneticScheduler:
     def __init__(self, n_staff, n_day, job, requirement, day_off, avoid_jobs, 
                  early, late, num_off, B, LB, weights):
@@ -36,7 +37,7 @@ class GeneticScheduler:
         self.LB = LB
         self.weights = weights
         
-        # 遗传算法参数
+        # 遺伝的アルゴリズムのパラメータ
         self.population_size = 50
         self.generations = 100
         self.mutation_rate = 0.1
@@ -44,52 +45,52 @@ class GeneticScheduler:
         self.elite_size = 5
         
     def create_individual(self):
-        """创建一个个体（排班方案）"""
+        """個体（勤務シフト案）を生成する"""
         individual = np.zeros((self.n_staff, self.n_day), dtype=int)
         
         for i in range(self.n_staff):
-            # 先设置休息日
+            # 先に休日を設定
             rest_days = random.sample(range(self.n_day), self.B[i])
             for day in rest_days:
                 individual[i][day] = 0
             
-            # 为工作日分配工作
+            # 勤務日に仕事を割り当てる
             work_days = [d for d in range(self.n_day) if d not in rest_days]
             available_jobs = [j for j in self.job if j != 0 and j not in self.avoid_jobs[i]]
             
             for day in work_days:
                 if day in self.day_off[i]:
-                    individual[i][day] = 0  # 希望休息的日子设为休息
+                    individual[i][day] = 0  # 休み希望日は休みに設定
                 else:
                     individual[i][day] = random.choice(available_jobs) if available_jobs else 0
         
         return individual
     
     def calculate_fitness(self, individual):
-        """计算个体的适应度（违反约束的惩罚分数，越低越好）"""
+        """個体の適応度を計算する（制約違反のペナルティスコア、低いほど良い）"""
         penalty = 0
         
-        # 1. 休み希望日出勤制约
+        # 1. 休み希望日出勤制約
         for i in range(self.n_staff):
             for t in range(self.n_day):
                 if t in self.day_off[i] and individual[i][t] != 0:
                     penalty += self.weights['obj_weight']
         
-        # 2. 5日连续出勤制约
+        # 2. 5日連続勤務制約
         for i in range(self.n_staff):
             for t in range(self.n_day - 5):
                 consecutive_work = sum(1 for s in range(t, t + 6) if individual[i][s] != 0)
                 if consecutive_work > 5:
                     penalty += self.weights['UB_max5_weight'] * (consecutive_work - 5)
         
-        # 3. 4日连续出勤制约
+        # 3. 4日連続勤務制約
         for i in range(self.n_staff):
             for t in range(self.n_day - 4):
                 consecutive_work = sum(1 for s in range(t, t + 5) if individual[i][s] != 0)
                 if consecutive_work > 4:
                     penalty += self.weights['UB_max4_weight'] * (consecutive_work - 4)
         
-        # 4. 4日连续休み制约
+        # 4. 4日連続休み制約
         for i in range(self.n_staff):
             for t in range(self.n_day - 3):
                 if t + 4 <= self.n_day:
@@ -98,7 +99,7 @@ class GeneticScheduler:
                     if work_in_period == 0:
                         penalty += self.weights['LB_min1_weight']
         
-        # 5. 当日必要人数下限满足
+        # 5. 当日必要人数下限制約
         for t in range(self.n_day):
             for j in self.job:
                 if j != 0:
@@ -106,36 +107,36 @@ class GeneticScheduler:
                     if actual_count < self.LB[t, j]:
                         penalty += self.weights['LBC_weight'] * (self.LB[t, j] - actual_count)
         
-        # 6. 不能做的工作约束
+        # 6. 担当不可能な勤務制約
         for i in range(self.n_staff):
             for t in range(self.n_day):
                 if individual[i][t] in self.avoid_jobs[i]:
-                    penalty += 1000  # 严重违反
+                    penalty += 1000  # 重大な違反
         
-        # 7. Staff1和Staff2的选择性出勤
+        # 7. Staff1とStaff2の選択的勤務
         for t in range(self.n_day):
             if individual[1][t] == 0 and individual[2][t] == 0:
                 penalty += self.weights['Disjective_weight']
         
-        # 8. 休-出勤-休みの回避
+        # 8. 休-勤務-休パターンの回避
         for i in range(self.n_staff):
             for t in range(self.n_day - 2):
                 if (individual[i][t] == 0 and individual[i][t+1] != 0 and individual[i][t+2] == 0):
                     penalty += self.weights['RestWorkRest_weight']
         
-        # 9. 遅番・早番の连续回避
+        # 9. 遅番・早番の連続回避
         for i in range(self.n_staff):
             for t in range(self.n_day - 1):
                 if (individual[i][t] in self.early and individual[i][t+1] in self.late):
                     penalty += self.weights['LateEarly_weight']
         
-        # 10. 月休日数约束
+        # 10. 月間休日数制約
         for i in range(self.n_staff):
             rest_days = sum(1 for t in range(self.n_day) if individual[i][t] == 0)
             if rest_days != self.B[i]:
                 penalty += self.weights['num_off_weight'] * abs(rest_days - self.B[i])
         
-        return -penalty  # 负值，因为我们要最大化适应度
+        return -penalty  # 適応度を最大化するため、負の値にする
     
     def crossover(self, parent1, parent2):
         """交叉操作"""
@@ -145,18 +146,18 @@ class GeneticScheduler:
         child1 = parent1.copy()
         child2 = parent2.copy()
         
-        # 随机选择交叉点
+        # ランダムに交叉点を選択
         cross_point = random.randint(0, self.n_day - 1)
         
         for i in range(self.n_staff):
-            # 交换交叉点后的基因
+            # 交叉点以降の遺伝子を交換
             child1[i][cross_point:] = parent2[i][cross_point:]
             child2[i][cross_point:] = parent1[i][cross_point:]
         
         return child1, child2
     
     def mutate(self, individual):
-        """变异操作"""
+        """突然変異操作"""
         mutated = individual.copy()
         
         for i in range(self.n_staff):
@@ -168,20 +169,20 @@ class GeneticScheduler:
         return mutated
     
     def local_search(self, individual):
-        """局部搜索优化"""
+        """局所探索による最適化"""
         best = individual.copy()
         best_fitness = self.calculate_fitness(best)
         
-        # 尝试改进每个员工的排班
+        # 各スタッフのシフトを改善しようと試みる
         for i in range(self.n_staff):
             for t in range(self.n_day):
-                if t not in self.day_off[i]:  # 不是希望休息的日子
+                if t not in self.day_off[i]:  # 休み希望日ではない
                     available_jobs = [j for j in self.job if j not in self.avoid_jobs[i]]
                     current_job = individual[i][t]
                     
                     for job in available_jobs:
                         if job != current_job:
-                            # 尝试新的工作安排
+                            # 新しい勤務割り当てを試す
                             test_individual = individual.copy()
                             test_individual[i][t] = job
                             fitness = self.calculate_fitness(test_individual)
@@ -192,35 +193,40 @@ class GeneticScheduler:
         
         return best
     
-    def solve(self, time_limit=30):
-        """使用遗传算法+局部搜索求解"""
-        start_time = time.time()  # 记录开始时间
+    def solve(self, time_limit=30, progress_callback=None):
+        """遺伝的アルゴリズム+局所探索で求解"""
+        start_time = time.time()  # 開始時間を記録
         
-        # 初始化种群
+        # 初期集団を生成
         population = [self.create_individual() for _ in range(self.population_size)]
         best_individual = None
         best_fitness = float('-inf')
         
         generation = 0
-        # 关键：在while循环条件中检查时间限制
+        # 重要：whileループの条件で時間制限をチェック
         while generation < self.generations and (time.time() - start_time) < time_limit:
-            # 计算适应度
+            # 進捗コールバックを更新
+            if progress_callback:
+                progress = min(generation / self.generations, (time.time() - start_time) / time_limit)
+                progress_callback(progress, generation, best_fitness)
+            
+            # 適応度を計算
             fitness_scores = [(ind, self.calculate_fitness(ind)) for ind in population]
             fitness_scores.sort(key=lambda x: x[1], reverse=True)
             
-            # 更新最佳个体
+            # 最良個体を更新
             if fitness_scores[0][1] > best_fitness:
                 best_individual = fitness_scores[0][0].copy()
                 best_fitness = fitness_scores[0][1]
             
-            # 选择精英
+            # エリートを選択
             elite = [ind for ind, _ in fitness_scores[:self.elite_size]]
             
-            # 生成新一代
+            # 新世代を生成
             new_population = elite.copy()
             
             while len(new_population) < self.population_size:
-                # 锦标赛选择
+                # トーナメント選択
                 tournament_size = 3
                 parents = random.sample(fitness_scores[:self.population_size//2], 2)
                 parent1, parent2 = parents[0][0], parents[1][0]
@@ -228,7 +234,7 @@ class GeneticScheduler:
                 # 交叉
                 child1, child2 = self.crossover(parent1, parent2)
                 
-                # 变异
+                # 突然変異
                 child1 = self.mutate(child1)
                 child2 = self.mutate(child2)
                 
@@ -237,7 +243,7 @@ class GeneticScheduler:
             population = new_population[:self.population_size]
             generation += 1
             
-            # 每10代进行一次局部搜索
+            # 10世代ごとに局所探索を実行
             if generation % 10 == 0 and best_individual is not None:
                 improved = self.local_search(best_individual)
                 improved_fitness = self.calculate_fitness(improved)
@@ -247,33 +253,280 @@ class GeneticScheduler:
         
         return best_individual, best_fitness, generation
 
+def create_random_schedule(n_staff, n_day, job, avoid_jobs, B):
+    """初期表示用にランダムな勤務シフト表を生成する"""
+    schedule = np.zeros((n_staff, n_day), dtype=int)
+    
+    for i in range(n_staff):
+        # 先に休日を設定
+        rest_days = random.sample(range(n_day), B[i])
+        for day in rest_days:
+            schedule[i][day] = 0
+        
+        # 勤務日に仕事を割り当てる
+        work_days = [d for d in range(n_day) if d not in rest_days]
+        available_jobs = [j for j in job if j != 0 and j not in avoid_jobs[i]]
+        
+        for day in work_days:
+            schedule[i][day] = random.choice(available_jobs) if available_jobs else 0
+    
+    return schedule
+
+def display_schedule(schedule, title="勤務シフト結果"):
+    """勤務シフト表を表示する汎用関数"""
+    n_staff, n_day = schedule.shape
+    
+    # 勤務タイプのマッピング
+    job_names = {
+        0: "休み",
+        1: "勤務A", 2: "勤務B",
+        3: "早番A", 4: "早番B", 5: "早番C", 6: "早番D",
+        7: "遅番A", 8: "遅番B", 9: "遅番C", 10: "遅番D",
+        11: "夜勤A", 12: "夜勤B", 13: "夜勤C"
+    }
+    
+    # 色のマッピング
+    color_map = {
+        0: "shift-休み",
+        1: "shift-早番A", 2: "shift-早番A",
+        3: "shift-早番A", 4: "shift-早番B", 5: "shift-早番C", 6: "shift-早番D",
+        7: "shift-遅番A", 8: "shift-遅番B", 9: "shift-遅番C", 10: "遅番D",
+        11: "shift-遅番A", 12: "shift-遅番B", 13: "shift-遅番C"
+    }
+    
+    st.subheader(title)
+    
+    # HTMLテーブルを作成
+    table_html = "<table style='width:80%; border-collapse: collapse; margin: 20px auto; font-size: 0.9rem;'>"
+    
+    # テーブルヘッダー
+    table_html += "<tr style='background-color: #f8f9fa;'>"
+    table_html += "<th style='padding: 8px; border: 1px solid #dee2e6; text-align: center; font-weight: bold; font-size: 1rem; color: #000;'>Staff</th>"
+    for t in range(n_day):
+        table_html += f"<th style='padding: 8px; border: 1px solid #dee2e6; text-align: center; font-weight: bold; font-size: 1rem; color: #000;'>Day{t+1}</th>"
+    table_html += "</tr>"
+    
+    # データ行
+    for i in range(n_staff):
+        table_html += f"<tr>"
+        table_html += f"<td style='padding: 8px; border: 1px solid #dee2e6; text-align: center; font-weight: bold; font-size: 0.95rem; color: #000; background-color: #f8f9fa;'>Staff{i}</td>"
+        for t in range(n_day):
+            job_id = schedule[i][t]
+            job_name = job_names.get(job_id, f"Job{job_id}")
+            color_class = color_map.get(job_id, "shift-休み")
+            table_html += f"<td style='padding: 0; border: 1px solid #dee2e6; text-align: center;'><div class='shift-cell {color_class}' style='padding: 6px; font-size: 0.75rem;'>{job_name}</div></td>"
+        table_html += "</tr>"
+    
+    table_html += "</table>"
+    
+    st.markdown(table_html, unsafe_allow_html=True)
+
+def schedule_to_excel(schedule):
+    """勤務シフト表をExcelファイルに変換する"""
+    n_staff, n_day = schedule.shape
+    
+    # 勤務タイプのマッピング
+    job_names = {
+        0: "休み",
+        1: "勤務A", 2: "勤務B",
+        3: "早番A", 4: "早番B", 5: "早番C", 6: "早番D",
+        7: "遅番A", 8: "遅番B", 9: "遅番C", 10: "遅番D",
+        11: "夜勤A", 12: "夜勤B", 13: "夜勤C"
+    }
+    
+    # DataFrameを作成
+    data = []
+    for i in range(n_staff):
+        row = [f"Staff{i}"]
+        for t in range(n_day):
+            job_id = schedule[i][t]
+            job_name = job_names.get(job_id, f"Job{job_id}")
+            row.append(job_name)
+        data.append(row)
+    
+    columns = ["Staff"] + [f"Day{t+1}" for t in range(n_day)]
+    df = pd.DataFrame(data, columns=columns)
+    
+    # Excelファイルを作成
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+        df.to_excel(writer, sheet_name='勤務シフト表', index=False)
+    
+    buffer.seek(0)
+    return buffer
+
 def main():
-    """a new app with Streamlit"""
+    """Streamlitによる新しいアプリ"""
+    
+    # カスタムスタイルを追加
+    st.markdown("""
+    <style>
+        .shift-cell {
+            padding: 0.5rem;
+            text-align: center;
+            border-radius: 4px;
+            font-size: 0.8rem;
+            font-weight: bold;
+            color: white;
+        }
+        
+        .shift-休み { background-color: #95a5a6; }
+        .shift-早番A { background-color: #3498db; }
+        .shift-早番B { background-color: #2980b9; }
+        .shift-早番C { background-color: #1abc9c; }
+        .shift-早番D { background-color: #16a085; }
+        .shift-遅番A { background-color: #e74c3c; }
+        .shift-遅番B { background-color: #c0392b; }
+        .shift-遅番C { background-color: #f39c12; }
+        .shift-遅番D { background-color: #d35400; }
+        
+        /* ファイルアップロードボタンのスタイルを変更 */
+        .stFileUploader {
+            width: 100% !important;
+        }
+        
+        .stFileUploader > div {
+            width: 100% !important;
+        }
+        
+        .stFileUploader > div > div {
+            width: 100% !important;
+            height: 60px !important;
+            border: 2px dashed #cccccc !important;
+            border-radius: 10px !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+        }
+        
+        .stFileUploader label {
+            font-size: 16px !important;
+            font-weight: bold !important;
+        }
+        
+        /* --- 変更点：ボタンコンテナのスタイルを調整 --- */
+        .long-button-container {
+            width: 100%;
+            margin: 10px 0;
+        }
+        
+        .stButton > button {
+            width: 100% !important;
+            height: 60px !important;
+            font-size: 16px !important;
+            font-weight: bold !important;
+            border-radius: 10px !important;
+        }
+        
+        .download-button {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 60px;
+            margin-top: 10px;
+        }
+        
+        /* 小さいフォントのスタイル */
+        .small-info {
+            font-size: 14px !important;
+            color: #666666 !important;
+        }
+    </style>
+    """, unsafe_allow_html=True)
     
     menu = ["Home","データ","モデル","About"]
     choice = st.sidebar.selectbox("Menu",menu)
     
     if choice == "データ":
         st.subheader("データ説明")
-        uploaded_xls = "optshift_sample2.xlsx"
-        sheet = pd.read_excel(uploaded_xls, sheet_name=None, engine='openpyxl')
-        print(sheet)
+        st.write("💡 Excelフォーマットは管理者に問い合わせてください。")
         
-        from PIL import Image
-        image4 = Image.open('data.PNG')
-        st.image(image4,use_column_width=True)    
+        # サンプルデータファイルが存在するかチェック
+        try:
+            uploaded_xls = "optshift_sample2.xlsx"
+            sheet = pd.read_excel(uploaded_xls, sheet_name=None, engine='openpyxl')
+            st.success("✅ サンプルデータが正常に読み込まれました")
+            
+            # データ構造情報を表示
+            st.write("**データシート構成:**")
+            for sheet_name in sheet.keys():
+                st.write(f"- {sheet_name}: {sheet[sheet_name].shape[0]}行 × {sheet[sheet_name].shape[1]}列")
+        except FileNotFoundError:
+            st.error("⚠️ サンプルデータファイル 'optshift_sample2.xlsx' が見つかりません")
+        
+        # 画像をチェックして表示
+        try:
+            from PIL import Image
+            if os.path.exists('data.PNG'):
+                image4 = Image.open('data.PNG')
+                st.image(image4, use_column_width=True)
+            else:
+                st.info("📊 データ構造の説明図が利用できません")
+                # テキスト形式でデータの説明を提供
+                st.markdown("""
+                ### データ構造説明
+                
+                **必要なExcelファイル構成:**
+                - **day1シート**: 各日の勤務タイプ情報
+                - **staff1シート**: スタッフの基本情報と制約
+                - **jobシート**: 勤務種別の定義
+                - **requirementシート**: 各勤務タイプの必要人数
+                
+                **主な列:**
+                - day_type: 勤務日のタイプ
+                - job_set: スタッフが対応可能な勤務
+                - day_off: 休み希望日
+                - requirement: 必要人数
+                """)
+        except ImportError:
+            st.error("PIL ライブラリがインストールされていません")
         
     elif choice == "モデル":
-        from PIL import Image
-        image2 = Image.open('mode3.PNG')
-        st.image(image2,use_column_width=True)    
-        image = Image.open('mode1.PNG')
-        st.image(image,use_column_width=True)
-        image1 = Image.open('mode2.PNG')
-        st.image(image1,use_column_width=True)
+        st.subheader("モデル説明")
+        
+        try:
+            from PIL import Image
+            # 各画像ファイルを個別にチェック
+            image_files = ['mode3.PNG', 'mode1.PNG', 'mode2.PNG']
+            image_loaded = False
+            
+            for img_file in image_files:
+                if os.path.exists(img_file):
+                    image = Image.open(img_file)
+                    st.image(image, use_column_width=True)
+                    image_loaded = True
+                    
+            if not image_loaded:
+                st.info("📈 モデル説明図が利用できません")
+                # テキスト形式でモデルの説明を提供
+                st.markdown("""
+                ### 最適化モデル概要
+                
+                **目的関数:**
+                - 各制約の違反を最小化
+                - 重み付きペナルティ方式
+                
+                **主要制約:**
+                1. 📅 休み希望日出勤制約
+                2. 🔄 連続勤務制限（4日・5日）
+                3. 💤 連続休暇制限（4日）
+                4. 👥 当日必要人数下限
+                5. ⚡ 早番・遅番連続回避
+                6. 🚫 スタッフ能力制約
+                7. 🔀 選択的勤務制約
+                8. 📊 月間休日数調整
+                
+                **求解手法:**
+                - 遺伝的アルゴリズム + 局所探索
+                - 集団サイズ: 50
+                - 世代数: 最大100世代
+                - 時間制限: 30秒
+                """)
+        except ImportError:
+            st.error("PIL ライブラリがインストールされていません")
         
     elif choice == "About":
-        st.subheader("About App")
+        st.subheader("アプリについて")
         st.write('張春来')
         st.write('東京海洋大学大学院　サプライチェーン最適化　数理最適化　')
         st.write('email: anlian0482@gmail.com')
@@ -287,33 +540,57 @@ def main():
         
         components.html(html_temp)
         
-        uploaded_file = st.file_uploader('1. データファイルをアップロードしてください。', type='xlsx')
+        # データ処理フラグを初期化
+        if 'data_loaded' not in st.session_state:
+            st.session_state.data_loaded = False
         
-        check = st.checkbox('サンプルデータを使います', value=False)
+        # ファイルアップロードボタン
+        st.markdown('<div class="long-button-container">', unsafe_allow_html=True)
+        uploaded_file = st.file_uploader('📁 データファイルをアップロードしてください', type='xlsx', help="Excelファイルを選択してください")
+        st.markdown('</div>', unsafe_allow_html=True)
+        # 小さいフォントのヒント情報を追加
+        st.markdown('<p class="small-info"> データフォーマットについては管理者にお問い合わせください（👇求解ボタンを押してサンプルデータで体験できます）</p>', unsafe_allow_html=True)
         
+        # データ読み込みを処理
+        load_data = False
         if uploaded_file is not None:
-            if 'push1' not in st.session_state:
-                st.session_state.push1 = False
+            sheet = pd.read_excel(uploaded_file, sheet_name=None, engine='openpyxl')
+            load_data = True
+            st.session_state.data_loaded = True
+        else:
+            # デフォルトでサンプルデータを使用
+            try:
+                uploaded_xls = "optshift_sample2.xlsx"
+                sheet = pd.read_excel(uploaded_xls, sheet_name=None, engine='openpyxl')
+                load_data = True
+            except FileNotFoundError:
+                st.error("⚠️ サンプルデータファイル 'optshift_sample2.xlsx' が見つかりません。データファイルをアップロードしてください。")
+                st.markdown("""
+                ### 必要なファイル形式
                 
-            button1 = st.button(' ファイル読み込み')
-            
-            if button1:
-                st.session_state.push1 = True
+                **Excelファイル(.xlsx)に以下のシートが必要:**
+                - `day1`: 各日の勤務タイプ情報
+                - `staff1`: スタッフ情報と制約
+                - `job`: 勤務種別定義  
+                - `requirement`: 必要人数設定
                 
-        if (uploaded_file is not None and st.session_state.push1) or check:
+                **サンプルファイルをお持ちでない場合は、管理者にお問い合わせください。**
+                """)
+                load_data = False
             
+        if load_data:
             st.sidebar.title("⚙️ 重み")
             obj_weight=st.sidebar.slider("休み希望日出勤制約", 0, 100, 90)
-            UB_max5_weight=st.sidebar.slider("５日連続出勤制約", 0, 100, 30)
-            UB_max4_weight=st.sidebar.slider("4日連続出勤制約", 0, 100, 20)
+            UB_max5_weight=st.sidebar.slider("５日連続勤務制約", 0, 100, 30)
+            UB_max4_weight=st.sidebar.slider("4日連続勤務制約", 0, 100, 20)
             LB_min1_weight=st.sidebar.slider("４日連続休み制約", 0, 100, 10)
-            LBC_weight=st.sidebar.slider("当日必要人数下限満足", 0, 100, 100)
-            Disjective_weight=st.sidebar.slider("Staff1とStaff2のいずれかが出勤", 0, 100, 10)
-            RestWorkRest_weight=st.sidebar.slider("休ー出勤ー休みの回避", 0, 100, 10)
+            LBC_weight=st.sidebar.slider("当日必要人数下限制約", 0, 100, 100)
+            Disjective_weight=st.sidebar.slider("Staff1とStaff2のいずれかが勤務", 0, 100, 10)
+            RestWorkRest_weight=st.sidebar.slider("休ー勤務ー休パターンの回避", 0, 100, 10)
             LateEarly_weight=st.sidebar.slider("遅番・早番の連続回避", 0, 80, 10)
-            num_off_weight=st.sidebar.slider("月休日最大化", 0, 60, 10)
+            num_off_weight=st.sidebar.slider("月間休日数の調整", 0, 60, 10)
             
-            # 权重字典
+            # 重み辞書
             weights = {
                 'obj_weight': obj_weight,
                 'UB_max5_weight': UB_max5_weight,
@@ -326,26 +603,18 @@ def main():
                 'num_off_weight': num_off_weight
             }
             
-            if uploaded_file is not None and st.session_state.push1:
-                sheet = pd.read_excel(uploaded_file, sheet_name=None, engine='openpyxl')
-                if button1:
-                    st.write(sheet)
-            else:
-                uploaded_xls = "optshift_sample2.xlsx"
-                sheet = pd.read_excel(uploaded_xls, sheet_name=None, engine='openpyxl')
-            
             month = 1 
             day_df = sheet["day"+str(month)]
             staff_df = sheet["staff"+str(month)]
             job_df = sheet["job"] 
             requirement_df = sheet["requirement"]
             
-            # 修改为15天排班
-            n_day = 15  # 改为15天
+            # 15日間の勤務シフトに変更
+            n_day = 15  # 15日に変更
             n_job = len(job_df)
             n_staff = 15
             
-            # 早番，遅番のシフト
+            # 早番、遅番のシフト
             early = [3,4,5,6] 
             late =  [7,8,9,10]
             # 月の休み
@@ -366,36 +635,36 @@ def main():
                     day_off[i] = set([])
                 else:
                     day_off[i] = set( ast.literal_eval(str(off)) )
-                # 确保休假日不超过15天范围
+                # 休日が15日の範囲を超えないようにする
                 day_off[i] = {d for d in day_off[i] if d < n_day}
             
-            # 避免工作
+            # 担当しない勤務
             avoid_job = {1,2,12,13}
             job_set = {}
             for i in range(n_staff):
                 job_set[i] = set(ast.literal_eval(staff_df.loc[i, "job_set"])) - avoid_job 
             
-            # 必要人数下限 - 只取前15天
+            # 必要人数下限 - 最初の15日間のみ取得
             LB = defaultdict(int)
-            for t in range(n_day):  # 只处理前15天
+            for t in range(n_day):  # 最初の15日間のみ処理
                 if t < len(day_df):
                     row = day_df.iloc[t]
                     for j in job:
                         LB[t,j] = requirement[row.day_type, j]
                 else:
-                    # 如果数据不足15天，使用最后一天的数据
+                    # データが15日分ない場合は、最終日のデータを使用
                     last_row = day_df.iloc[-1]
                     for j in job:
                         LB[t,j] = requirement[last_row.day_type, j]
             
-            # 最大休み日数
+            # 最大休日日数
             B = {}
             for i in range(n_staff):
                 B[i] = max(num_off, len(day_off[i]))
-                # 确保休假日数不超过总天数
+                # 休日日数が総日数を超えないようにする
                 B[i] = min(B[i], n_day)
             
-            # 定义每个员工不能做的工作
+            # 各スタッフが担当できない勤務を定義
             avoid_jobs = {
                 0: [1,2,4,5,7,8,9,11,12,13],
                 1: [1,2,4,5,8,9,11,12,13],
@@ -414,202 +683,245 @@ def main():
                 14: [1,2,3,7,8,11,12,13]
             }
             
-            # 创建求解按钮
-            if st.button("遗传算法求解"):
-                with st.spinner("正在使用遗传算法+局部搜索求解中..."):
-                    # 创建遗传算法求解器
-                    ga_solver = GeneticScheduler(
-                        n_staff=n_staff,
-                        n_day=n_day,
-                        job=job,
-                        requirement=requirement,
-                        day_off=day_off,
-                        avoid_jobs=avoid_jobs,
-                        early=early,
-                        late=late,
-                        num_off=num_off,
-                        B=B,
-                        LB=LB,
-                        weights=weights
-                    )
+            # 求解ボタン
+            st.markdown('<div class="long-button-container">', unsafe_allow_html=True)
+            if st.button("　　　　　　　　　　　　　🧬 遺伝的アルゴリズムで求解　　　　　　　　　　　　　　　", type="primary", help="遺伝的アルゴリズムを使用して勤務シフト計画を最適化します"):
+                # プログレスバーを作成
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                # 遺伝的アルゴリズムソルバーを作成
+                ga_solver = GeneticScheduler(
+                    n_staff=n_staff,
+                    n_day=n_day,
+                    job=job,
+                    requirement=requirement,
+                    day_off=day_off,
+                    avoid_jobs=avoid_jobs,
+                    early=early,
+                    late=late,
+                    num_off=num_off,
+                    B=B,
+                    LB=LB,
+                    weights=weights
+                )
+                
+                # 進捗コールバック関数
+                def progress_callback(progress, generation, fitness):
+                    progress_bar.progress(progress)
+                    status_text.text(f"進化中... 第{generation}世代, 現在の最良適応度: {fitness:.2f}")
+                
+                # 求解
+                start_time = time.time()
+                best_solution, best_fitness, generations = ga_solver.solve(
+                    time_limit=30, 
+                    progress_callback=progress_callback
+                )
+                end_time = time.time()
+                
+                # 完了後にプログレスバーを更新
+                progress_bar.progress(1.0)
+                status_text.text("✅ 求解完了！")
+                
+                if best_solution is not None:
+                    st.session_state.optimized_schedule = best_solution
+                    st.success(f"✅ 最適解が見つかりました！")
                     
-                    # 求解
-                    start_time = time.time()
-                    best_solution, best_fitness, generations = ga_solver.solve(time_limit=30)
-                    end_time = time.time()
+                    # 求解統計情報を表示
+                    col_stat1, col_stat2, col_stat3 = st.columns(3)
+                    with col_stat1:
+                        st.metric("求解時間", f"{end_time - start_time:.2f}秒")
+                    with col_stat2:
+                        st.metric("進世代数", generations)
+                    with col_stat3:
+                        st.metric("最良適応度", f"{best_fitness:.2f}")
                     
-                    st.success(f"求解完成！")
-                    st.write(f"求解时间: {end_time - start_time:.2f}秒")
-                    st.write(f"进化代数: {generations}")
-                    st.write(f"最佳适应度: {best_fitness}")
+                    st.rerun()
+                else:
+                    st.error("❌ 求解に失敗しました。パラメータを調整して再試行してください")
+            st.markdown('</div>', unsafe_allow_html=True)
+            
+            # ランダムな勤務シフト表を初期化して表示
+            if 'initial_schedule' not in st.session_state:
+                st.session_state.initial_schedule = create_random_schedule(n_staff, n_day, job, avoid_jobs, B)
+            
+            # 現在の勤務シフト表を表示（最適化結果があればそれを、なければランダム生成されたものを表示）
+            if 'optimized_schedule' in st.session_state:
+                display_schedule(st.session_state.optimized_schedule, "最適化後の勤務シフト結果")
+            else:
+                display_schedule(st.session_state.initial_schedule, "勤務シフト表")
+                st.info("💡 上に表示されているのはランダムに生成された初期勤務シフト表です。「遺伝的アルゴリズムで求解」ボタンをクリックして、シフト計画を最適化してください！")
+            
+            # ダウンロードボタンを追加（最適化結果がある場合に表示）
+            if 'optimized_schedule' in st.session_state:
+                st.markdown('<div class="download-button">', unsafe_allow_html=True)
+                excel_buffer = schedule_to_excel(st.session_state.optimized_schedule)
+                st.download_button(
+                    label="📥 勤務シフト表をダウンロード",
+                    data=excel_buffer,
+                    file_name="optimized_schedule.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    help="最適化された勤務シフト表をExcelファイルでダウンロード"
+                )
+                st.markdown('</div>', unsafe_allow_html=True)
+            
+            # 最適化結果がある場合、統計情報を表示
+            if 'optimized_schedule' in st.session_state:
+                # 制約違反状況の統計
+                st.subheader("📊 制約違反状況の統計")
+                
+                violations = {}
+                best_solution = st.session_state.optimized_schedule
+                
+                # 1. 休み希望日出勤制約
+                hope_violations = 0
+                hope_total = 0
+                for i in range(n_staff):
+                    for t in range(n_day):
+                        if t in day_off[i]:
+                            hope_total += 1
+                            if best_solution[i][t] != 0:
+                                hope_violations += 1
+                violations["休み希望日出勤制約"] = {"違反": hope_violations, "総数": hope_total}
+                
+                # 2. 5日連続勤務制約
+                max5_violations = 0
+                max5_total = 0
+                for i in range(n_staff):
+                    for t in range(n_day - 5):
+                        max5_total += 1
+                        consecutive_work = sum(1 for s in range(t, t + 6) if best_solution[i][s] != 0)
+                        if consecutive_work > 5:
+                            max5_violations += (consecutive_work - 5)
+                violations["5日連続勤務制約"] = {"違反": max5_violations, "総数": max5_total}
+                
+                # 3. 4日連続勤務制約
+                max4_violations = 0
+                max4_total = 0
+                for i in range(n_staff):
+                    for t in range(n_day - 4):
+                        max4_total += 1
+                        consecutive_work = sum(1 for s in range(t, t + 5) if best_solution[i][s] != 0)
+                        if consecutive_work > 4:
+                            max4_violations += (consecutive_work - 4)
+                violations["4日連続勤務制約"] = {"違反": max4_violations, "総数": max4_total}
+                
+                # 4. 4日連続休み制約
+                rest_violations = 0
+                rest_total = 0
+                for i in range(n_staff):
+                    for t in range(n_day - 3):
+                        if t + 4 <= n_day:
+                            rest_total += 1
+                            consecutive_days = set(range(t, t + 4)) - day_off[i]
+                            work_in_period = sum(1 for s in consecutive_days if s < n_day and best_solution[i][s] != 0)
+                            if work_in_period == 0:
+                                rest_violations += 1
+                violations["4日連続休み制約"] = {"違反": rest_violations, "総数": rest_total}
+                
+                # 5. 当日必要人数下限制約
+                requirement_violations = 0
+                requirement_total = 0
+                for t in range(n_day):
+                    for j in job:
+                        if j != 0:
+                            requirement_total += 1
+                            actual_count = sum(1 for i in range(n_staff) if best_solution[i][t] == j)
+                            if actual_count < LB[t, j]:
+                                requirement_violations += (LB[t, j] - actual_count)
+                violations["当日必要人数下限制約"] = {"違反": requirement_violations, "総数": requirement_total}
+                
+                # 6. 勤務能力制約
+                avoid_violations = 0
+                avoid_total = n_staff * n_day
+                for i in range(n_staff):
+                    for t in range(n_day):
+                        if best_solution[i][t] in avoid_jobs[i]:
+                            avoid_violations += 1
+                violations["勤務能力制約"] = {"違反": avoid_violations, "総数": avoid_total}
+                
+                # 7. Staff1・2選択勤務制約
+                disjunctive_violations = 0
+                disjunctive_total = n_day
+                for t in range(n_day):
+                    if best_solution[1][t] == 0 and best_solution[2][t] == 0:
+                        disjunctive_violations += 1
+                violations["Staff1・2選択勤務制約"] = {"違反": disjunctive_violations, "総数": disjunctive_total}
+                
+                # 8. 休-勤務-休パターン回避
+                pattern_violations = 0
+                pattern_total = 0
+                for i in range(n_staff):
+                    for t in range(n_day - 2):
+                        pattern_total += 1
+                        if (best_solution[i][t] == 0 and best_solution[i][t+1] != 0 and best_solution[i][t+2] == 0):
+                            pattern_violations += 1
+                violations["休-勤務-休パターン回避"] = {"違反": pattern_violations, "総数": pattern_total}
+                
+                # 9. 遅番・早番連続回避
+                shift_violations = 0
+                shift_total = 0
+                for i in range(n_staff):
+                    for t in range(n_day - 1):
+                        shift_total += 1
+                        if (best_solution[i][t] in early and best_solution[i][t+1] in late):
+                            shift_violations += 1
+                violations["遅番・早番連続回避"] = {"違反": shift_violations, "総数": shift_total}
+                
+                # 10. 月間休日数制約
+                off_violations = 0
+                off_total = n_staff
+                for i in range(n_staff):
+                    rest_days = sum(1 for t in range(n_day) if best_solution[i][t] == 0)
+                    if rest_days != B[i]:
+                        off_violations += abs(rest_days - B[i])
+                violations["月間休日数制約"] = {"違反": off_violations, "総数": off_total}
+                
+                # 制約違反統計テーブルを作成
+                constraint_data = []
+                total_violations = 0
+                total_constraints = 0
+                
+                for constraint_name, data in violations.items():
+                    violation_count = data["違反"]
+                    total_count = data["総数"]
+                    satisfaction_rate = ((total_count - violation_count) / total_count * 100) if total_count > 0 else 100
+                    status = "✅" if violation_count == 0 else "❌"
                     
-                    if best_solution is not None:
-                        # 显示结果
-                        st.subheader("排班结果")
-                        
-                        # 创建结果DataFrame
-                        result_df = pd.DataFrame(best_solution)
-                        result_df.index = [f"Staff{i}" for i in range(n_staff)]
-                        result_df.columns = [f"Day{i+1}" for i in range(n_day)]
-                        
-                        st.dataframe(result_df)
-                        
-                        # 约束违约情况统计
-                        st.subheader("约束违约情况统计")
-                        
-                        violations = {}
-                        
-                        # 1. 休み希望日出勤违约
-                        hope_violations = 0
-                        hope_total = 0
-                        for i in range(n_staff):
-                            for t in range(n_day):
-                                if t in day_off[i]:
-                                    hope_total += 1
-                                    if best_solution[i][t] != 0:
-                                        hope_violations += 1
-                        violations["休み希望日出勤制約"] = {"违约": hope_violations, "总数": hope_total}
-                        
-                        # 2. 5日连续出勤违约
-                        max5_violations = 0
-                        max5_total = 0
-                        for i in range(n_staff):
-                            for t in range(n_day - 5):
-                                max5_total += 1
-                                consecutive_work = sum(1 for s in range(t, t + 6) if best_solution[i][s] != 0)
-                                if consecutive_work > 5:
-                                    max5_violations += (consecutive_work - 5)
-                        violations["5日连続出勤制約"] = {"违约": max5_violations, "总数": max5_total}
-                        
-                        # 3. 4日连续出勤违约
-                        max4_violations = 0
-                        max4_total = 0
-                        for i in range(n_staff):
-                            for t in range(n_day - 4):
-                                max4_total += 1
-                                consecutive_work = sum(1 for s in range(t, t + 5) if best_solution[i][s] != 0)
-                                if consecutive_work > 4:
-                                    max4_violations += (consecutive_work - 4)
-                        violations["4日连続出勤制約"] = {"违约": max4_violations, "总数": max4_total}
-                        
-                        # 4. 4日连续休み违约
-                        rest_violations = 0
-                        rest_total = 0
-                        for i in range(n_staff):
-                            for t in range(n_day - 3):
-                                if t + 4 <= n_day:
-                                    rest_total += 1
-                                    consecutive_days = set(range(t, t + 4)) - day_off[i]
-                                    work_in_period = sum(1 for s in consecutive_days if s < n_day and best_solution[i][s] != 0)
-                                    if work_in_period == 0:
-                                        rest_violations += 1
-                        violations["4日連続休み制約"] = {"违约": rest_violations, "总数": rest_total}
-                        
-                        # 5. 当日必要人数下限违约
-                        requirement_violations = 0
-                        requirement_total = 0
-                        for t in range(n_day):
-                            for j in job:
-                                if j != 0:
-                                    requirement_total += 1
-                                    actual_count = sum(1 for i in range(n_staff) if best_solution[i][t] == j)
-                                    if actual_count < LB[t, j]:
-                                        requirement_violations += (LB[t, j] - actual_count)
-                        violations["当日必要人数下限制約"] = {"违约": requirement_violations, "总数": requirement_total}
-                        
-                        # 6. 不能做的工作违约
-                        avoid_violations = 0
-                        avoid_total = n_staff * n_day
-                        for i in range(n_staff):
-                            for t in range(n_day):
-                                if best_solution[i][t] in avoid_jobs[i]:
-                                    avoid_violations += 1
-                        violations["工作能力制約"] = {"违约": avoid_violations, "总数": avoid_total}
-                        
-                        # 7. Staff1和Staff2选择性出勤违约
-                        disjunctive_violations = 0
-                        disjunctive_total = n_day
-                        for t in range(n_day):
-                            if best_solution[1][t] == 0 and best_solution[2][t] == 0:
-                                disjunctive_violations += 1
-                        violations["Staff1・2選択出勤制約"] = {"违约": disjunctive_violations, "总数": disjunctive_total}
-                        
-                        # 8. 休-出勤-休み违约
-                        pattern_violations = 0
-                        pattern_total = 0
-                        for i in range(n_staff):
-                            for t in range(n_day - 2):
-                                pattern_total += 1
-                                if (best_solution[i][t] == 0 and best_solution[i][t+1] != 0 and best_solution[i][t+2] == 0):
-                                    pattern_violations += 1
-                        violations["休-出勤-休パターン回避"] = {"违约": pattern_violations, "总数": pattern_total}
-                        
-                        # 9. 遅番・早番连续违约
-                        shift_violations = 0
-                        shift_total = 0
-                        for i in range(n_staff):
-                            for t in range(n_day - 1):
-                                shift_total += 1
-                                if (best_solution[i][t] in early and best_solution[i][t+1] in late):
-                                    shift_violations += 1
-                        violations["遅番・早番連続回避"] = {"违约": shift_violations, "总数": shift_total}
-                        
-                        # 10. 月休日数违约
-                        off_violations = 0
-                        off_total = n_staff
-                        for i in range(n_staff):
-                            rest_days = sum(1 for t in range(n_day) if best_solution[i][t] == 0)
-                            if rest_days != B[i]:
-                                off_violations += abs(rest_days - B[i])
-                        violations["月休日数制約"] = {"违约": off_violations, "总数": off_total}
-                        
-                        # 创建约束违约统计表格
-                        constraint_data = []
-                        total_violations = 0
-                        total_constraints = 0
-                        
-                        for constraint_name, data in violations.items():
-                            violation_count = data["违约"]
-                            total_count = data["总数"]
-                            satisfaction_rate = ((total_count - violation_count) / total_count * 100) if total_count > 0 else 100
-                            status = "✅" if violation_count == 0 else "❌"
-                            
-                            constraint_data.append({
-                                "约束类型": constraint_name,
-                                "状态": status,
-                                "违约数": violation_count,
-                                "总约束数": total_count,
-                                "满足率": f"{satisfaction_rate:.1f}%"
-                            })
-                            
-                            total_violations += violation_count
-                            total_constraints += total_count
-                        
-                        # 显示统计表格
-                        constraint_df = pd.DataFrame(constraint_data)
-                        st.dataframe(constraint_df, use_container_width=True)
-                        
-                        # 显示总体质量评估
-                        overall_satisfaction = ((total_constraints - total_violations) / total_constraints * 100) if total_constraints > 0 else 100
-                        
-                        col1, col2, col3, col4 = st.columns(4)
-                        with col1:
-                            st.metric("总约束数", total_constraints)
-                        with col2:
-                            st.metric("总违约数", total_violations, delta=f"-{total_violations}" if total_violations > 0 else "0")
-                        with col3:
-                            st.metric("整体满足率", f"{overall_satisfaction:.1f}%")
-                        with col4:
-                            if total_violations == 0:
-                                st.success("🎉 完美解决方案！")
-                            elif overall_satisfaction >= 80:
-                                st.success("🟢 优秀解决方案")
-                            elif overall_satisfaction >= 70:
-                                st.warning("🟡 良好解决方案")
-                            else:
-                                st.error("🔴 需要改进")
+                    constraint_data.append({
+                        "制約タイプ": constraint_name,
+                        "ステータス": status,
+                        "違反数": violation_count,
+                        "総制約数": total_count,
+                        "充足率": f"{satisfaction_rate:.1f}%"
+                    })
+                    
+                    total_violations += violation_count
+                    total_constraints += total_count
+                
+                # 統計テーブルを表示
+                constraint_df = pd.DataFrame(constraint_data)
+                st.dataframe(constraint_df, use_container_width=True)
+                
+                # 全体的な品質評価を表示
+                overall_satisfaction = ((total_constraints - total_violations) / total_constraints * 100) if total_constraints > 0 else 100
+                
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("総制約数", total_constraints)
+                with col2:
+                    st.metric("総違反数", total_violations, delta=f"-{total_violations}" if total_violations > 0 else "0")
+                with col3:
+                    st.metric("全体充足率", f"{overall_satisfaction:.1f}%")
+                with col4:
+                    if total_violations == 0:
+                        st.success("🎉 完璧なソリューションです！")
+                    elif overall_satisfaction >= 80:
+                        st.success("🟢 優れたソリューションです")
+                    elif overall_satisfaction >= 70:
+                        st.warning("🟡 良好なソリューションです")
                     else:
-                        st.error("求解失败，请调整参数后重试")
+                        st.error("🔴 改善が必要です")
 
 if __name__ == '__main__':
     main()
