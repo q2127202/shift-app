@@ -531,13 +531,11 @@ def main():
         st.write('東京海洋大学大学院　サプライチェーン最適化　数理最適化　')
         st.write('email: anlian0482@gmail.com')
     else:
-        st.subheader("Home")
         html_temp = """
         <div style="background-color:royalblue;padding:10px;border-radius:10px">
-        <h1 style="color:white;text-align:center;">シフト・スケジューリング　アプリ</h1>
+        <h1 style="color:white;text-align:center;">🤖シフト・スケジューリングアプリ</h1>
         </div>
         """
-        
         components.html(html_temp)
         
         # データ処理フラグを初期化
@@ -618,7 +616,7 @@ def main():
             early = [3,4,5,6] 
             late =  [7,8,9,10]
             # 月の休み
-            num_off = 9 
+            num_off = 4
             # jobset
             job = [0,1,2,3,4,5,6,7,8,9,10,11,12,13]
             
